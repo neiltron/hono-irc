@@ -50,8 +50,8 @@ const parseAddress = (address = ''): string | undefined => {
  * The IRC server. All the connections are held by one Durable Object, so it can write
  * a message from a client to the sockets of the others.
  *
- * The users and the channels are in memory. A channel disappears when the last member leaves,
- * so they do not need to be stored while the object has a connection. The accounts are stored in
+ * The users and the channels are in memory. An ordinary channel disappears when the last member
+ * leaves. The accounts, the permanent channels, the messages, and the read markers are stored in
  * the SQLite database of the object, whose API is synchronous, as the handlers are.
  */
 export class Network extends DurableObject<Env> {

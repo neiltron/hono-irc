@@ -8,7 +8,7 @@ An IRC server on Cloudflare Workers and Durable Objects, built with [Hono](https
 ```sh
 pnpm install
 pnpm dev        # Cloudflare Workers, with `cf dev`
-pnpm dev:node   # Node.js, on the port of `PORT` or 6667, with the accounts in the SQLite file of `DATABASE`, or in memory
+pnpm dev:node   # Node.js, on the port of `PORT` or 6667, with the database in the SQLite file of `DATABASE`, or in memory
 ```
 
 Connect with any IRC client to `localhost:6667` without TLS, or with a web client to `ws://localhost:5173/` (Cloudflare Workers only, see [WebSocket](#websocket)).
@@ -38,6 +38,8 @@ app.on('TCP', '/PRIVMSG/:targets/:text', (c) => { ... })
 | [`src/flood.ts`](./src/flood.ts)                                 | The flood control: a token bucket and fake lag for each connection        |
 | [`src/store.ts`](./src/store.ts)                                 | The database: a synchronous SQL interface on SQLite, and the migrations   |
 | [`src/accounts.ts`](./src/accounts.ts)                           | The accounts: the hashes of the passwords, the storage, and the limits    |
+| [`src/history.ts`](./src/history.ts)                             | The stored messages and read markers: the queries and the retention       |
+| [`src/channels-store.ts`](./src/channels-store.ts)               | The permanent channels (`+P`) in the database                             |
 | [`src/cloak.ts`](./src/cloak.ts)                                 | The cloaks: the hosts shown in place of the addresses, with HMAC-SHA-256  |
 | [`src/masks.ts`](./src/masks.ts)                                 | The masks of bans and exceptions: `nick!user@host` with `*` and `?`       |
 | [`src/commands/registration.ts`](./src/commands/registration.ts) | `CAP`, `NICK`, `USER`, `PASS`, `PING`, `PONG`, `QUIT`                     |
@@ -50,6 +52,8 @@ app.on('TCP', '/PRIVMSG/:targets/:text', (c) => { ... })
 | [`src/commands/setname.ts`](./src/commands/setname.ts)           | `SETNAME`                                                                 |
 | [`src/commands/sasl.ts`](./src/commands/sasl.ts)                 | `AUTHENTICATE`: SASL and its mechanisms, of which `PLAIN`                 |
 | [`src/commands/account.ts`](./src/commands/account.ts)           | `REGISTER` and `VERIFY`: account registration                             |
+| [`src/commands/chathistory.ts`](./src/commands/chathistory.ts)   | `CHATHISTORY` (`draft/chathistory`), and `replayOnJoin`                   |
+| [`src/commands/markread.ts`](./src/commands/markread.ts)         | `MARKREAD` (`draft/read-marker`)                                          |
 | [`src/websocket.ts`](./src/websocket.ts)                         | The IRCv3 WebSocket transport: a WebSocket as a socket of `tcp-hono`      |
 | [`src/index.ts`](./src/index.ts)                                 | Cloudflare Workers: the Worker and the Durable Object                     |
 | [`src/node.ts`](./src/node.ts)                                   | Node.js                                                                   |
@@ -65,8 +69,9 @@ app.on('TCP', '/PRIVMSG/:targets/:text', (c) => { ... })
 - A runtime hands over a socket with `connect(socket, info)` of the server.
 - On Cloudflare Workers, the `connect()` handler of the Worker pipes the socket to the `connect()` handler of one Durable Object. The object holds all the connections, which is why a message from a client can be written to the sockets of the others.
 - A WebSocket goes to the same object: the `fetch()` handler of the Worker forwards the upgrade request to it, and `fromWebSocket()` of `src/websocket.ts` turns the WebSocket into a socket for the same `connect()` of the server. A WebSocket client and a TCP client are in the same channels.
-- The users and the channels are in memory. An IRC channel disappears when the last member leaves, so nothing needs to be stored as long as the Durable Object stays in memory while it has a connection. A deploy or a restart of the object disconnects everyone, and the clients reconnect.
-- The accounts are stored, in the SQLite database of the Durable Object, or of `node:sqlite` on Node.js (see [Accounts](#accounts)).
+- The users and the channels are in memory. An ordinary IRC channel disappears when the last member leaves. A deploy or a restart of the object disconnects everyone, and the clients reconnect.
+- The accounts, the permanent channels, the messages, and the read markers are stored, in the SQLite database of the Durable Object, or of `node:sqlite` on Node.js (see [Accounts](#accounts) and [History and permanent channels](#history-and-permanent-channels)). A handler writes what it changes as it changes it, synchronously.
+- Every `PRIVMSG`, `NOTICE`, and `TAGMSG`, single or multiline, goes through `deliver()` of `src/commands/messages.ts`, which decides, stores the message once, and sends it to each recipient with `present()`. A message that is played back from the history goes through `present()` too, so the rules of the capabilities are the same.
 
 ## WebSocket
 
@@ -95,7 +100,8 @@ The dependency is pinned to a commit, and pnpm builds it on install. To update i
 
 - Registration: `CAP`, `NICK`, `USER`, `PASS` (not checked), `PING`, `PONG`, `QUIT`
 - Accounts: `AUTHENTICATE` (SASL `PLAIN`), `REGISTER`, `VERIFY`, and the nicknames that the accounts reserve (see [Accounts](#accounts))
-- Channels: `JOIN` (with keys), `PART`, `TOPIC`, `NAMES`, `LIST`, `KICK`, `INVITE`, and `MODE` with `CHANMODES=beI,k,l,imnst` and `PREFIX=(ov)@+`:
+- Channels: `JOIN` (with keys), `PART`, `TOPIC`, `NAMES`, `LIST`, `KICK`, `INVITE`, and `MODE` with `CHANMODES=beI,k,l,Pimnst` (`imnst` without a database) and `PREFIX=(ov)@+`:
+  - `+P`: a permanent channel, which is stored and stays when it is empty (see [History and permanent channels](#history-and-permanent-channels)).
   - `+b` bans, `+e` ban exceptions, and `+I` invite exceptions: masks `nick!user@host` with `*` and `?`, in ASCII case, kept in their full form (`bob` is `bob!*@*`, `*@host` is `*!*@host`). A backslash escapes `*`, `?`, and `\`. `MODE #channel b` lists the bans to anyone who can see the channel, and `e` and `I` only to its operators.
   - A banned client can not join (`ERR_BANNEDFROMCHAN`), send to the channel from inside or outside (`PRIVMSG`, `NOTICE`, `TAGMSG`, or a multiline message), or change its nickname while it is in the channel (`ERR_BANNICKCHANGE`, 435), unless it is an operator or has voice there. An exception (`+e`) cancels a ban.
   - `+i`: only an invited client, or one that matches an invite exception, can join. Any member can invite to a channel without `+i`, and only an operator to one with it. An invite lets the client in in spite of `+i`, `+k`, and `+l`, but not of a ban, and is used up when it joins. `INVITE` without parameters lists the invites of the client. A client keeps its last 50 invites, which go away with it and with the channel.
@@ -105,7 +111,7 @@ The dependency is pinned to a commit, and pnpm builds it on install. To update i
 - Users: `MODE` with `+i` (an invisible user is left out of `NAMES` and `WHO` of a channel for those outside it) and `+B` (bot mode)
 - Messages: `PRIVMSG`, `NOTICE`, `TAGMSG`, `AWAY`, and multiline messages
 - Queries: `WHO` (with WHOX), `WHOIS`, `ISON`, `USERHOST`, `MOTD`, `LUSERS`, `MONITOR`
-- IRCv3: capability negotiation 3.2, `cap-notify`, `server-time`, `echo-message`, `multi-prefix`, `userhost-in-names`, `extended-join`, `away-notify`, `invite-notify`, `monitor`, `extended-monitor`, `setname`, `bot-mode`, `no-implicit-names`, WHOX, `message-tags`, `message-ids`, `batch`, `labeled-response`, `standard-replies`, `draft/multiline`, `UTF8ONLY`, `sasl` (3.1 and 3.2), `draft/account-registration`, `account-notify`, `account-tag`, and the WebSocket transport (Cloudflare Workers only)
+- IRCv3: capability negotiation 3.2, `cap-notify`, `server-time`, `echo-message`, `multi-prefix`, `userhost-in-names`, `extended-join`, `away-notify`, `invite-notify`, `monitor`, `extended-monitor`, `setname`, `bot-mode`, `no-implicit-names`, WHOX, `message-tags`, `message-ids`, `batch`, `labeled-response`, `standard-replies`, `draft/multiline`, `UTF8ONLY`, `sasl` (3.1 and 3.2), `draft/account-registration`, `account-notify`, `account-tag`, `draft/chathistory` with the `chathistory` batch, `draft/read-marker`, and the WebSocket transport (Cloudflare Workers only)
   - `message-tags`: the client-only tags of `PRIVMSG`, `NOTICE`, and `TAGMSG` are relayed to the clients that have the capability, whether the sender has it or not, and `TAGMSG` is delivered only to them. The other tags of a client are never relayed. `CLIENTTAGDENY=` says that every client-only tag is allowed. `TAGMSG` is answered like `PRIVMSG`, without `RPL_AWAY`.
   - `msgid`: every `PRIVMSG`, `NOTICE`, `TAGMSG`, and multiline message has one, the same for all its recipients and the echo, and one for each target. It is like a ULID: the time in milliseconds and 80 random bits, so the IDs sort by time and do not repeat after a restart.
   - `labeled-response` is used only when the client also has `batch`, which it depends on. A label longer than 64 bytes is ignored. A message to oneself with `echo-message` comes twice, the delivered one without the label and the echo with it.
@@ -123,19 +129,21 @@ The dependency is pinned to a commit, and pnpm builds it on install. To update i
 - The address of the client is passed to the server, from `CF-Connecting-IP` for a WebSocket and from the Worker for TCP (see below). It is not shown to the other users, who see a cloak (see below).
 - A client that does not answer a `PING` is disconnected, and so is one that has not registered in time after it connected.
 - Limits, set with the options of `createServer()`:
-  - `flood`: a token bucket for each connection, by default 10 commands at once and one more every 2 seconds, with `NICK`, `JOIN`, `PART`, `AUTHENTICATE` (2), and `REGISTER` (3) taking more. `AUTHENTICATE` and `REGISTER`, which hash a password, take their cost before the registration too. A client that runs out is not disconnected: its commands wait until the tokens are back (fake lag), so a burst is handled in full and in order, only slower. The others are not slowed down. `false` turns it off. The lines of a multiline batch are free, and the batch takes one token for every 512 bytes or every 5 lines, whichever is more, when it ends.
+  - `flood`: a token bucket for each connection, by default 10 commands at once and one more every 2 seconds, with `NICK`, `JOIN`, `PART`, `AUTHENTICATE`, `CHATHISTORY` (2), and `REGISTER` (3) taking more. `AUTHENTICATE` and `REGISTER`, which hash a password, take their cost before the registration too. A client that runs out is not disconnected: its commands wait until the tokens are back (fake lag), so a burst is handled in full and in order, only slower. The others are not slowed down. `false` turns it off. The lines of a multiline batch are free, and the batch takes one token for every 512 bytes or every 5 lines, whichever is more, when it ends.
   - `multiline`: `maxBytes` (4096), `maxLines` (100), and `timeout` (30 seconds) of a `draft/multiline` batch.
   - `maxConnections` (1000), `maxConnectionsPerIp` (10, when the runtime knows the address), and `maxChannels` (1000).
   - `accounts`: see [Accounts](#accounts).
+  - `persistChannels`, `permanentChannels`, `history`, and `replayOnJoin`: see [History and permanent channels](#history-and-permanent-channels).
 
 ## What is not implemented
 
 - TLS over TCP. According to the Cloudflare documentation, Spectrum terminates TLS for a Worker only with the Enterprise add-on, and `startTls()` is not supported for an inbound socket. A WebSocket has TLS (`wss://`) once deployed, which has not been tried.
 - Operators and server-to-server links. Extended bans, such as by account.
 - Of the accounts: the SASL mechanisms other than `PLAIN` (`SCRAM-SHA-256`, `EXTERNAL`), reauthentication (a client that is logged in gets `ERR_SASLALREADY`) and so logging out, email and verification, changing or resetting a password, deleting an account, `draft/ACCOUNTREQUIRED`, and rehashing a password with new parameters when it logs in.
-- Anything stored but the accounts: chat history, registered channels, always-on clients, read markers.
+- Always-on clients, and a way to delete what is stored about an account (an account can not be deleted either).
+- `draft/event-playback`: only `PRIVMSG` and `NOTICE` are stored (see [History and permanent channels](#history-and-permanent-channels)).
 - The WebSocket transport on Node.js, which has no WebSocket server built in. `src/websocket.ts` does not depend on a runtime.
-- The other IRCv3 extensions, such as `chathistory`, `chghost`, and `STATUSMSG`. No standard reply is sent beyond what a spec defines, so `standard-replies` changes nothing yet.
+- The other IRCv3 extensions, such as `chghost`, `STATUSMSG`, and the `draft/chathistory-context` messages. No standard reply is sent beyond what a spec defines, so `standard-replies` changes nothing yet.
 - `ELIST`, and the parameters of `LIST`. `WHO` with a mask that is not a channel or a nickname. `KNOCK`.
 
 ## Accounts
@@ -158,7 +166,62 @@ A client registers an account with `REGISTER` (`draft/account-registration`) and
 - On Cloudflare Workers, the SQLite database of the Durable Object, with `ctx.storage.sql.exec()` and `ctx.storage.transactionSync()`. It is in the storage of the object, so the accounts survive restarts and deploys. Under `cf dev`, it is in `.cloudflare/state`.
 - On Node.js, `node:sqlite` (`DatabaseSync`), in the file of `DATABASE`, or in memory without it. `createServer()` without `database` uses an in-memory database where the runtime has `node:sqlite`, which is loaded with `process.getBuiltinModule()`, so the bundle of the Worker does not import it.
 
-The schema is a list of migrations, each applied once in a transaction, at startup. A database whose schema is newer than the server is refused. The writes of an account are one transaction. The messages already have IDs that sort by time (`msgid`), so a table of history can be added as a migration.
+The schema is a list of migrations, each applied once in a transaction, at startup. A database whose schema is newer than the server is refused. The writes of an account are one transaction. Migration 2 adds the permanent channels, the history, and the read markers.
+
+## History and permanent channels
+
+With a database, a channel and its messages outlive the moment everyone is offline, so a client that comes back, such as one on a phone, gets what it missed. Without one (`database: false`), there is no `P` mode, `draft/chathistory` and `draft/read-marker` are not advertised, `CHATHISTORY` and `MARKREAD` are unknown commands, and nothing is stored.
+
+### Permanent channels
+
+- A channel that a client logged in to an account creates records that account as its founder, and is permanent (`+P`) unless `persistChannels` is off, or the founder already has `permanentChannels.maxPerAccount` (20) permanent channels, or the server `maxChannels` (10,000). It is then an ordinary channel, with its founder, which can set `+P` later. Only the founder, logged in and in the channel, sets or clears `P`: another member gets `ERR_CHANOPRIVSNEEDED` (482), the founder outside the channel `ERR_NOTONCHANNEL` (442), and a founder over a limit `ERR_TOOMANYCHANNELS` (405).
+- What is stored: the name as it was created, the creation time, the founder (the folded name of its account), the topic with who set it and when, the modes of type D, the key, the limit, and the lists `b`, `e`, and `I` with who set each mask and when. A `MODE` or `TOPIC` that changes any of it updates the row in the same request, in one statement. The members, the operators and voices, and the invites are not stored.
+- When the last member leaves, the row stays, and the channel object goes from memory. The next `JOIN` restores it as it was, and its key, limit, bans, and `+i` apply. The founder, logged in to its account, gets `o` whenever it joins; nobody else gets `o` for arriving first. Another member can be given `o` as usual.
+- `-P` makes it an ordinary channel and deletes its row at once, in the same transaction that lets its history go with the channel. This differs from the decision "deletes the stored row once empty" only in when, and no stale row can survive a restart.
+- A permanent channel that nobody has joined for `permanentChannels.expire` (90 days) is purged with its history by `tick()`, ten at a time.
+- An empty permanent channel shows in `LIST` with 0 users, and `TOPIC` and `MODE` (with the lists) answer for it as for a channel that nobody can see from inside, unless it is secret (`+s`): then it is not listed, and those get `ERR_NOSUCHCHANNEL`. `NAMES` and `WHOIS` show no members, as it has none.
+
+### draft/chathistory
+
+[`CHATHISTORY`](https://ircv3.net/specs/extensions/chathistory) with `LATEST`, `BEFORE`, `AFTER`, `AROUND`, `BETWEEN`, and `TARGETS`, `CHATHISTORY=100` (`history.limit`), and `MSGREFTYPES=msgid,timestamp`.
+
+- A message is a row of the table `history`, written by `deliver()` once it is allowed (after `canSend()`), before it is sent, in the request: every `PRIVMSG` and `NOTICE`, and a multiline message as one row, with its msgid, the time of the msgid, the mask of the sender at the time, its account, its bot mode, the target as the recipients got it, the text or the lines, and the client-only tags. `TAGMSG` is not stored. If the database fails, the message is delivered anyway.
+- The msgids sort by time (`Server.msgid()`), and the `time` tag of a message is the time of its msgid, so the order of the history is the order of the msgids, and every query is a range of the index `(target, msgid)`. A `timestamp=` reference is turned into a bound of msgids, and a `msgid=` reference is a position in that order whether the message is still stored or not. The bounds are exclusive; `AROUND` gives half the limit before the reference and the rest from it on, the message itself included. `TARGETS` takes timestamps only.
+- The reply is a `chathistory` batch for a client with `batch`, with `draft/chathistory-end` on the first line when there is nothing more in that direction, and plain lines otherwise. A reply has at most `limit` messages and stops at about 256 KiB, after one message at least. Each message is sent by `present()`, as when it was delivered: its original `time` and `msgid`, the `account` and `bot` tags of the sender as they were then (not as they are now), the client-only tags for a client with `message-tags`, and a multiline message as a `draft/multiline` batch nested in the `chathistory` one, or as its lines without the blank ones, with the msgid on the first. Playing back changes nothing: nothing is stored, marked as read, echoed, or answered with `RPL_AWAY`.
+- Every `FAIL` code of the spec: `INVALID_PARAMS` (unknown subcommand, missing or extra parameters, a reference or a limit that does not parse, `*` other than for `LATEST`, a msgid for `TARGETS`), `INVALID_MSGREFTYPE` (a reference type other than `msgid` and `timestamp`), `INVALID_TARGET`, and `MESSAGE_ERROR` when the database fails.
+- The client need not have negotiated `draft/chathistory` to use the command; the capability tells the server not to send history by itself (`replayOnJoin`).
+- `draft/event-playback` is not implemented. The table could hold the events, but `QUIT` and `NICK` would write a row for each channel of the user, a reconnecting phone `JOIN` and `QUIT` in each of its channels, and typing notifications would be most of the `TAGMSG`s, all sharing the limit of each target with the messages, or needing a second index to page the messages alone.
+
+#### Who reads what
+
+- A channel's history is for its current members only. A member that is banned and has neither `o` nor `v` gets `INVALID_TARGET`, as does a client outside the channel, and anyone for a channel that is not in memory. A member reads the whole history of a permanent channel, and the history of an ordinary channel from when it joined. An ordinary channel's history is deleted when the channel ends (a little at a time by `tick()`; a new channel of the same name starts empty), and at a restart.
+- A direct message is stored only when both the sender and the recipient are logged in to accounts, by the pair of accounts, not by the nicknames: either account reads the conversation from any connection, after a change of nickname, or when the other is offline. A nickname as the target stands for the account of the client that has it, or else for the account of that name. A client that is not logged in has no direct history. The messages are played back as they were sent, with the nicknames of the time.
+- `TARGETS` lists the channels the client is in that it may read, and the accounts it has direct messages with (by the names of the accounts), by the time of their last message.
+
+#### Retention
+
+Set with `history` of `createServer()`, and enforced a little at a time, so that no request does unbounded work:
+
+- `maxMessages` (10,000): the newest messages of each target. Each new message deletes the oldest of its target over the limit (at most 3 at a time, if the limit was lowered).
+- `maxAge` (90 days): each new message deletes up to 2 messages of its target that are older, and `tick()` up to 1,000 of the oldest of the server.
+- `maxRows` (2,000,000): the server keeps at most the last `maxRows` messages it stored; each new message deletes up to 2 that are older than that.
+- The counts of the messages of a target are read once from the index, and then kept in memory.
+
+#### What is stored about the users
+
+The mask (`nick!user@cloak`, never the address) and the account of the sender of each stored message, and its bot mode, for as long as the message is kept; the founder of each permanent channel, and who set its topic and each mask of its lists, as IRC shows them; the read markers of each account. A direct message between two accounts is readable by both. Nothing is stored for a client that is not logged in, but the messages that it sends to channels.
+
+#### The cost
+
+One message is one row of `history` and one entry of its index, `(target, msgid)`: 2 rows written on a Durable Object, plus the 2 to delete when a target is full. The first message of a channel or of a pair of accounts also writes a row of `targets`. A multiline message at the largest size that the capability advertises (4,096 bytes in 100 lines, with 4,094 bytes of client-only tags) takes at most about 60 KB in JSON, even with control characters, far below the limit of 2 MB of a row. At 2,000,000 rows, the history takes about 1 GB of the 10 GB of a Durable Object.
+
+### draft/read-marker
+
+[`MARKREAD`](https://ircv3.net/specs/extensions/read-marker): a marker belongs to an account, for a channel that exists or for the direct messages with another account, is stored as one row, only moves forward (not past the time of the server), and is sent to the other connections of the account with the capability when it moves, and on `JOIN`, before `RPL_ENDOFNAMES`. A client that is not logged in gets `*`, and setting a marker fails with `INTERNAL_ERROR`. An account has at most 1,000 markers. The errors are `NEED_MORE_PARAMS`, `INVALID_PARAMS`, and `INTERNAL_ERROR`.
+
+### replayOnJoin
+
+`replayOnJoin` (0, off): a client without `draft/chathistory` gets the last N messages that it may read (so, in practice, those of a permanent channel) when it joins, in a `chathistory` batch if it has `batch`, before the names.
 
 ## The address of the client
 
@@ -189,6 +252,7 @@ pnpm test        # vp test
 pnpm check       # vp check: format, lint, and type check
 pnpm typecheck   # with the types of Cloudflare Workers
 PORT=6701 pnpm dev:node & pnpm e2e 127.0.0.1 6701   # a smoke test with irc-framework
+pnpm dev & pnpm e2e 127.0.0.1 6667                   # the same under cf dev
 ```
 
 Node.js 24 or later is required.

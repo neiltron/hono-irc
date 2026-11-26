@@ -5,7 +5,8 @@ import type { Socket } from 'tcp-hono'
 import { createServer } from './server.ts'
 import { nodeStore } from './store.ts'
 
-// Node.js. The accounts are stored in the SQLite file of `DATABASE`, or in memory without it.
+// Node.js. The accounts, the permanent channels, and the history are stored in the SQLite file of
+// `DATABASE`, or in memory without it.
 const database = nodeStore(new DatabaseSync(process.env.DATABASE ?? ':memory:'))
 const server = createServer({ database })
 
