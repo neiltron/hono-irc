@@ -92,9 +92,18 @@ export const chathistory = (server: Server) => {
   server.isupport.set('CHATHISTORY', String(history.limit))
   server.isupport.set('MSGREFTYPES', 'msgid,timestamp')
 
-  /** The msgid from which a member reads the history of a channel. */
-  const floor = (client: Client, channel: Channel) =>
-    channel.permanent ? FIRST : channel.joined.get(client)! + '0'
+  /**
+   * The msgid from which a member reads the history of a channel: from when it joined, or in a
+   * permanent channel, from when the channel became permanent, if that is earlier.
+   */
+  const floor = (client: Client, channel: Channel) => {
+    const joined = channel.joined.get(client)! + '0'
+    if (!channel.permanent) {
+      return joined
+    }
+    const since = channel.since ?? FIRST
+    return since < joined ? since : joined
+  }
 
   /** The history of a target that the client may read, or `undefined`. */
   const readable = (client: Client, name: string): Readable | undefined => {

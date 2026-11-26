@@ -126,7 +126,10 @@ export const deliver = (
   const channel = server.channels.get(server.fold(targetName))
   if (channel) {
     if (!channel.canSend(client)) {
-      return [[ERR_CANNOTSENDTOCHAN, channel.name, 'Cannot send to channel']]
+      // A secret channel that the client is not in is answered as one that does not exist.
+      return channel.visibleTo(client)
+        ? [[ERR_CANNOTSENDTOCHAN, channel.name, 'Cannot send to channel']]
+        : [[ERR_NOSUCHNICK, echo(targetName), 'No such nick/channel']]
     }
     const chat = compose(channel.name)
     store(() => server.record(channel, chat))

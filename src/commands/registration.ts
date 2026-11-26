@@ -10,7 +10,7 @@ import {
   ERR_NOORIGIN,
 } from '../numerics.ts'
 import { MAX_LINE_LENGTH, format, truncate } from '../protocol.ts'
-import { NAME_LENGTH, RESERVED, echo, isNickname, msg } from '../state.ts'
+import { NAME_LENGTH, RESERVED, echo, isNickname } from '../state.ts'
 import type { Env, Line, Server } from '../state.ts'
 
 // A `CAP LS` reply is split into lines of this many bytes of capabilities.
@@ -114,9 +114,13 @@ export const registration = (server: Server) => {
     if (!isNickname(nick)) {
       return c.render([ERR_ERRONEUSNICKNAME, echo(nick), 'Erroneous nickname'])
     }
-    const owner = server.nicks.get(server.fold(nick))
-    if (owner && owner !== client) {
-      return c.render([ERR_NICKNAMEINUSE, nick, 'Nickname is already in use'])
+    const holder = server.nicks.get(server.fold(nick))
+    if (holder && holder !== client) {
+      // The nickname of an account is its own: a client logged in to it takes it from one that
+      // is not, such as a connection that has not registered and holds it meanwhile.
+      if (!server.reclaim(client, nick, holder)) {
+        return c.render([ERR_NICKNAMEINUSE, nick, 'Nickname is already in use'])
+      }
     }
     if (nick === client.nick) {
       return c.render()
@@ -139,20 +143,7 @@ export const registration = (server: Server) => {
         'Cannot change nickname while banned on channel',
       ])
     }
-    if (client.registered) {
-      for (const target of [client, ...server.peers(client)]) {
-        target.send(msg(client.mask, 'NICK', nick))
-      }
-    }
-    const previous = client.nick
-    server.nicks.delete(server.fold(client.nick))
-    server.nicks.set(server.fold(nick), client)
-    client.nick = nick
-    // A change of case is the same nickname for MONITOR.
-    if (client.registered && server.fold(previous) !== server.fold(nick)) {
-      server.notifyMonitors(previous)
-      server.notifyMonitors(nick, client)
-    }
+    server.rename(client, nick)
     return c.render(...server.register(client))
   })
 

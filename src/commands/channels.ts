@@ -165,7 +165,8 @@ export const channels = (server: Server) => {
     }
     const lines: Line[] = []
     for (const channelName of list.split(',')) {
-      const channel = server.channels.get(server.fold(channelName))
+      // A secret channel that the client is not in is answered as one that does not exist.
+      const channel = server.visible(channelName, client)
       if (!channel) {
         lines.push([ERR_NOSUCHCHANNEL, echo(channelName), 'No such channel'])
       } else if (!channel.members.has(client)) {
@@ -187,14 +188,14 @@ export const channels = (server: Server) => {
     if (!channelName) {
       return c.render([ERR_NEEDMOREPARAMS, 'TOPIC', 'Not enough parameters'])
     }
-    // A permanent channel that is empty has its topic too.
-    const channel = server.find(channelName)
+    // A permanent channel that is empty has its topic too. A secret channel that the client is not
+    // in is answered as one that does not exist.
+    const channel = server.find(channelName, client)
     if (!channel) {
       return c.render([ERR_NOSUCHCHANNEL, echo(channelName), 'No such channel'])
     }
     const ranks = channel.members.get(client)
-    // The topic of a secret channel is only for its members.
-    if (text === undefined && channel.visibleTo(client)) {
+    if (text === undefined) {
       return c.render(...server.topic(channel))
     }
     if (!ranks) {
@@ -225,7 +226,7 @@ export const channels = (server: Server) => {
     const { targets, excess } = server.targets(list, MAX_TARGETS.NAMES)
     return c.render(
       ...targets.flatMap((channelName): Line[] => {
-        const channel = server.channels.get(server.fold(channelName))
+        const channel = server.visible(channelName, client)
         return channel
           ? server.names(client, channel)
           : [[RPL_ENDOFNAMES, echo(channelName), 'End of /NAMES list']]
@@ -295,7 +296,7 @@ export const channels = (server: Server) => {
     if (!channelName || !list) {
       return c.render([ERR_NEEDMOREPARAMS, 'KICK', 'Not enough parameters'])
     }
-    const channel = server.channels.get(server.fold(channelName))
+    const channel = server.visible(channelName, client)
     if (!channel) {
       return c.render([ERR_NOSUCHCHANNEL, echo(channelName), 'No such channel'])
     }
@@ -337,7 +338,7 @@ export const channels = (server: Server) => {
     if (!target?.registered) {
       return c.render([ERR_NOSUCHNICK, echo(nick), 'No such nick/channel'])
     }
-    const channel = server.channels.get(server.fold(channelName))
+    const channel = server.visible(channelName, client)
     if (!channel) {
       return c.render([ERR_NOSUCHCHANNEL, echo(channelName), 'No such channel'])
     }

@@ -32,11 +32,13 @@ export const markread = (server: Server) => {
   }
   server.capabilities.set(CAPABILITY, undefined)
 
-  /** The folded target of a marker: a channel that exists, or an account. */
-  const key = (name: string): string | undefined => {
+  /**
+   * The folded target of a marker: a channel that exists, and that the client can see, as a secret
+   * one is answered for as one that does not exist, or an account.
+   */
+  const key = (client: Client, name: string): string | undefined => {
     if (name[0] === '#') {
-      const folded = server.fold(name)
-      return server.channels.has(folded) || server.channelStore?.get(folded) ? folded : undefined
+      return server.find(name, client) ? server.fold(name) : undefined
     }
     return server.accountOf(name)?.folded
   }
@@ -59,7 +61,7 @@ export const markread = (server: Server) => {
     if (!target) {
       return c.render(fail('MARKREAD', 'NEED_MORE_PARAMS', 'Missing parameters'))
     }
-    const folded = key(target)
+    const folded = key(client, target)
     if (!folded) {
       return c.render(fail('MARKREAD', 'INVALID_PARAMS', echo(target), 'Invalid target'))
     }

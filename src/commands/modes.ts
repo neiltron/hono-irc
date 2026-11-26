@@ -134,8 +134,9 @@ export const modes = (server: Server) => {
       return c.render([ERR_NEEDMOREPARAMS, 'MODE', 'Not enough parameters'])
     }
 
-    // A permanent channel that is empty shows its modes and lists too.
-    const channel = server.find(targetName)
+    // A permanent channel that is empty shows its modes and lists too. A secret channel that the
+    // client is not in is answered as one that does not exist.
+    const channel = server.find(targetName, client)
     if (!channel) {
       if (targetName[0] === '#') {
         return c.render([ERR_NOSUCHCHANNEL, echo(targetName), 'No such channel'])

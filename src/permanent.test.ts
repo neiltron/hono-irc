@@ -238,6 +238,107 @@ describe('The mode P', () => {
   })
 })
 
+describe('The history of a channel that becomes permanent', () => {
+  const caps = ['draft/chathistory']
+  const history = async (client: TestClient, channel = '#x') =>
+    (await exchange(client, `CHATHISTORY LATEST ${channel} * 10`)).filter((line) =>
+      line.startsWith('PRIVMSG ')
+    )
+
+  it('Should not show what was said before to those who were not there', async () => {
+    const { user } = setup()
+    const alice = await user('alice', caps)
+    const bob = await user('bob', caps)
+    await transcript(alice, 'JOIN #x', 'MODE #x -P')
+    await transcript(bob, 'JOIN #x')
+    await transcript(alice, 'PART #x')
+    await transcript(bob, 'PRIVMSG #x :while alice is away')
+    await transcript(alice, 'JOIN #x')
+    expect(await history(alice)).toEqual([])
+    expect(await exchange(alice, 'MODE #x +P')).toEqual(['MODE #x +P'])
+    // alice reads from when she joined, as before.
+    expect(await history(alice)).toEqual([])
+    await transcript(bob, 'PRIVMSG #x :now it is permanent')
+    expect(await history(alice)).toEqual(['PRIVMSG #x :now it is permanent'])
+    // bob was there: he reads both.
+    expect(await history(bob)).toEqual([
+      'PRIVMSG #x :while alice is away',
+      'PRIVMSG #x :now it is permanent',
+    ])
+    // carol, who joins later, reads from when it became permanent.
+    const carol = await user('carol', caps)
+    await transcript(carol, 'JOIN #x')
+    expect(await history(carol)).toEqual(['PRIVMSG #x :now it is permanent'])
+  })
+
+  it('Should not widen what anyone reads when P is cleared and set again, or restored', async () => {
+    const { user, store } = setup()
+    const alice = await user('alice', caps)
+    await transcript(alice, 'JOIN #x', 'PRIVMSG #x :first era')
+    await transcript(alice, 'MODE #x -P', 'PRIVMSG #x ordinary', 'MODE #x +P')
+    await transcript(alice, 'PRIVMSG #x :second era')
+    const carol = await user('carol', caps)
+    await transcript(carol, 'JOIN #x')
+    expect(await history(carol)).toEqual(['PRIVMSG #x :second era'])
+    // alice has been there all along.
+    expect(await history(alice)).toEqual([
+      'PRIVMSG #x :first era',
+      'PRIVMSG #x ordinary',
+      'PRIVMSG #x :second era',
+    ])
+    // Once restored, the boundary is the stored one.
+    await quit(alice, carol)
+    expect(store.query('SELECT since FROM channels')).toEqual([{ since: expect.any(String) }])
+    const dave = await user('dave', caps)
+    await transcript(dave, 'JOIN #x')
+    expect(await history(dave)).toEqual(['PRIVMSG #x :second era'])
+  })
+
+  it('Should show the whole history of a channel that was permanent from the start', async () => {
+    const { user, store } = setup()
+    const alice = await user('alice', caps)
+    await transcript(alice, 'JOIN #x', 'PRIVMSG #x :one', 'PRIVMSG #x :two')
+    expect(store.query('SELECT since FROM channels')).toEqual([{ since: null }])
+    const bob = await user('bob', caps)
+    await transcript(bob, 'JOIN #x')
+    expect(await history(bob)).toEqual(['PRIVMSG #x one', 'PRIVMSG #x two'])
+  })
+})
+
+describe('The founder of a permanent channel', () => {
+  it('Should join in spite of +b, +i, +k, and +l, and get o', async () => {
+    const { user, register } = setup()
+    const alice = await user('alice')
+    const bob = await user('bob')
+    const guest = await register('guest')
+    await transcript(alice, 'JOIN #home', 'MODE #home +o bob')
+    await transcript(bob, 'JOIN #home')
+    await transcript(alice, 'MODE #home +o bob')
+    for (const mode of ['+b alice!*@*', '+i', '+k secret', '+l 1']) {
+      await transcript(bob, 'MODE #home -bikl alice!*@* *', `MODE #home ${mode}`)
+      await transcript(bob, 'KICK #home alice')
+      expect(await exchange(alice, 'JOIN #home')).toEqual([
+        'JOIN #home',
+        '353 alice = #home :@bob @alice',
+        '366 alice #home :End of /NAMES list',
+      ])
+    }
+    // Another client is still refused.
+    expect(await exchange(guest, 'JOIN #home')).toEqual([
+      '471 guest #home :Cannot join channel (+l)',
+    ])
+    // And when the channel is empty and restored.
+    await transcript(alice, 'MODE #home +i-l')
+    await quit(bob)
+    await transcript(alice, 'PART #home')
+    expect(await exchange(alice, 'JOIN #home')).toEqual([
+      'JOIN #home',
+      '353 alice = #home @alice',
+      '366 alice #home :End of /NAMES list',
+    ])
+  })
+})
+
 describe('An empty permanent channel', () => {
   it('Should be listed, and show its topic and modes, unless it is secret', async () => {
     const { user, register } = setup()

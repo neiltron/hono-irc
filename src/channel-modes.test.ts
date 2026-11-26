@@ -433,8 +433,8 @@ describe('Secret (+s)', () => {
       '323 carol :End of /LIST',
       '366 carol #a :End of /NAMES list',
       '315 carol #a :End of /WHO list',
-      "442 carol #a :You're not on that channel",
-      '368 carol #a :End of channel ban list',
+      '403 carol #a :No such channel',
+      '403 carol #a :No such channel',
     ])
     expect((await exchange(carol, 'WHOIS bob')).find((line) => line.startsWith('319'))).toBe(
       '319 carol bob #b'
@@ -448,6 +448,40 @@ describe('Secret (+s)', () => {
       '319 bob alice :@#a @#b'
     )
     expect(codes(await exchange(bob, 'LIST'))).toEqual(['321', '322', '322', '323'])
+  })
+
+  it('Should answer those outside it as for a channel that does not exist', async () => {
+    const { alice, carol } = await channel()
+    await exchange(alice, 'MODE #a +s', 'TOPIC #a :plans', 'JOIN #open')
+    await exchange(carol, 'JOIN #open')
+    // The name in another case, as the replies to a channel that exists would correct it.
+    const ask = (name: string) => [
+      `TOPIC ${name}`,
+      `TOPIC ${name} :mine`,
+      `MODE ${name}`,
+      `MODE ${name} b`,
+      `MODE ${name} +b x`,
+      `NAMES ${name}`,
+      `WHO ${name}`,
+      `WHO ${name} %cnf`,
+      `PART ${name}`,
+      `KICK ${name} alice`,
+      `INVITE alice ${name}`,
+      `PRIVMSG ${name} :hi`,
+      `TAGMSG ${name}`,
+      `CHATHISTORY LATEST ${name} * 10`,
+    ]
+    const strip = (lines: string[]) => lines.map((line) => line.replaceAll('#none', '#A'))
+    expect(await exchange(carol, ...ask('#A'))).toEqual(
+      strip(await exchange(carol, ...ask('#none')))
+    )
+    expect((await exchange(carol, 'WHOIS alice')).find((line) => line.startsWith('319'))).toBe(
+      '319 carol alice @#open'
+    )
+    // And MARKREAD.
+    expect(await exchange(carol, 'MARKREAD #A')).toEqual(
+      strip(await exchange(carol, 'MARKREAD #none'))
+    )
   })
 })
 

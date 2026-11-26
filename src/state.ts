@@ -606,9 +606,14 @@ export class Channel {
 
   /**
    * Whether the client may join with the key, or the error that stops it. An invite lets the client
-   * in in spite of +i, +k, and +l, but not of a ban.
+   * in in spite of +i, +k, and +l, but not of a ban. The founder of a permanent channel, logged in
+   * to its account, always may, so that nobody can lock it out of its channel, which only it can
+   * give operators to.
    */
   canJoin(client: Client, key?: string): Line | undefined {
+    if (this.permanent && client.server.founds(client, this)) {
+      return
+    }
     const invited = this.invited.has(client)
     if (this.banned(client)) {
       return [ERR_BANNEDFROMCHAN, this.name, 'Cannot join channel (+b)']
@@ -1009,6 +1014,7 @@ export class Server {
       channel.lists[mode].push({ mask, by, at, glob: compile(this.fold(mask)) })
     }
     channel.history = row.history ?? undefined
+    channel.since = row.since ?? undefined
     return channel
   }
 
@@ -1016,8 +1022,11 @@ export class Server {
    * A channel by its name: one that has members, or a permanent one that is empty, which is not
    * added to the channels. A secret one that is empty is left out, as nobody is in it.
    */
-  find(name: string): Channel | undefined {
+  find(name: string, client?: Client): Channel | undefined {
     const channel = this.channels.get(this.fold(name)) ?? this.restore(name)
+    if (client) {
+      return channel?.visibleTo(client) ? channel : undefined
+    }
     return channel && (channel.members.size || !channel.modes.has('s')) ? channel : undefined
   }
 
@@ -1328,6 +1337,73 @@ export class Server {
       tags.account ??= sender.account
     }
     return { ...message, tags }
+  }
+
+  /**
+   * Change the nickname of a client, which is free: the NICK goes to the client and the ones that
+   * share a channel with it, once it has registered, and the ones that monitor either nickname are
+   * told.
+   */
+  rename(client: Client, nick: string) {
+    if (client.registered) {
+      for (const target of [client, ...this.peers(client)]) {
+        target.send(msg(client.mask, 'NICK', nick))
+      }
+    }
+    const previous = client.nick
+    if (this.nicks.get(this.fold(previous)) === client) {
+      this.nicks.delete(this.fold(previous))
+    }
+    this.nicks.set(this.fold(nick), client)
+    client.nick = nick
+    // A change of case is the same nickname for MONITOR.
+    if (client.registered && this.fold(previous) !== this.fold(nick)) {
+      this.notifyMonitors(previous)
+      this.notifyMonitors(nick, client)
+    }
+  }
+
+  /**
+   * Take the nickname of an account from the client that holds it, for a client that is logged in
+   * to the account, if the holder is not, and reserved nicknames are on. Returns whether the
+   * nickname is free now.
+   *
+   * A holder that has not registered loses its nickname and gets ERR_NICKNAMEINUSE, as when the
+   * registration finds that its nickname is reserved, and sends another one. One that has, which can
+   * happen only if the account was made, or the reservation turned on, while it had the nickname,
+   * is renamed to a free `Guest` nickname, which the others see as a NICK.
+   */
+  reclaim(client: Client, nick: string, holder: Client): boolean {
+    const owner = this.fold(nick)
+    if (
+      !this.accounts?.reserveNicknames ||
+      client.account === undefined ||
+      this.fold(client.account) !== owner ||
+      (holder.account !== undefined && this.fold(holder.account) === owner)
+    ) {
+      return false
+    }
+    if (!holder.registered) {
+      this.nicks.delete(owner)
+      holder.nick = '*'
+      this.reply(holder, [[ERR_NICKNAMEINUSE, nick, RESERVED]], false)
+      return true
+    }
+    let guest: string
+    do {
+      guest = `Guest${crypto.getRandomValues(new Uint32Array(1))[0] % 100_000_000}`
+    } while (this.nicks.has(this.fold(guest)))
+    holder.send(
+      msg(
+        this.name,
+        'NOTICE',
+        holder.nick,
+        `Your nickname is reserved by an account, so it is now ${guest}`
+      ),
+      false
+    )
+    this.rename(holder, guest)
+    return true
   }
 
   /**

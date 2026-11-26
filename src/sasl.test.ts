@@ -545,6 +545,53 @@ describe('Reserved nicknames', () => {
     ])
   })
 
+  it('Should take the nickname of the account from a connection that has not registered', async () => {
+    const { handler, register, account } = setup()
+    await account('alice')
+    const squatter = connect(handler)
+    await exchange(squatter, 'NICK alice')
+    const owner = await register('owner', ['monitor'])
+    await login(owner, 'alice')
+    expect(await exchange(owner, 'NICK alice')).toEqual([':owner!~owner@host NICK alice'])
+    expect(await squatter.waitFor(/ 433 /)).toBe(
+      ':irc.example 433 * alice :Nickname is reserved by a different account'
+    )
+    // It sends another one, and registers with it.
+    expect((await exchange(squatter, 'NICK other', 'USER o 0 * :O'))[0]).toMatch(/ 001 other /)
+    // A client that is not logged in to the account does not take it.
+    const bob = await register('bob')
+    expect(await exchange(bob, 'NICK alice')).toEqual([
+      ':irc.example 433 bob alice :Nickname is already in use',
+    ])
+  })
+
+  it('Should rename a registered client that holds the nickname of the account', async () => {
+    const { register, account } = setup()
+    // carol had the nickname before the account was made.
+    const holder = await register('carol')
+    const peer = await register('peer', ['monitor'])
+    await exchange(holder, 'JOIN #a')
+    await exchange(peer, 'JOIN #a', 'MONITOR + carol')
+    await account('carol')
+    const owner = await register('owner')
+    await login(owner, 'carol')
+    expect(await exchange(owner, 'NICK carol')).toEqual([':owner!~owner@host NICK carol'])
+    const guest = (await holder.waitFor(/ NICK /)).match(/ NICK (Guest\d+)$/)![1]
+    expect(holder.lines.at(-2)).toMatch(
+      new RegExp(`NOTICE carol :Your nickname is reserved by an account, so it is now ${guest}$`)
+    )
+    expect(norm(await peer.waitFor(/ NICK /))).toBe(`:carol!~carol@host NICK ${guest}`)
+    // The monitor sees the nickname go offline, then come back, as the owner.
+    await peer.waitFor(/ 731 peer carol$/)
+    await peer.waitFor(/ 730 peer carol!~owner@/)
+    // The holder of the account itself, on another connection, does not lose it.
+    const other = await register('second')
+    await login(other, 'carol')
+    expect(await exchange(other, 'NICK carol')).toEqual([
+      ':irc.example 433 second carol :Nickname is already in use',
+    ])
+  })
+
   it('Should not reserve the nicknames when it is turned off', async () => {
     const { register, account } = setup({ accounts: { reserveNicknames: false } })
     await account('alice')
