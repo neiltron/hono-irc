@@ -43,7 +43,9 @@ app.on('TCP', '/PRIVMSG/:targets/:text', (c) => { ... })
 | [`src/commands/messages.ts`](./src/commands/messages.ts)         | `PRIVMSG`, `NOTICE`, `TAGMSG`, `AWAY`                                     |
 | [`src/commands/multiline.ts`](./src/commands/multiline.ts)       | `BATCH` from a client: the batches of `draft/multiline`                   |
 | [`src/commands/modes.ts`](./src/commands/modes.ts)               | `MODE`                                                                    |
-| [`src/commands/queries.ts`](./src/commands/queries.ts)           | `WHO`, `WHOIS`, `ISON`, `USERHOST`, `MOTD`, `LUSERS`                      |
+| [`src/commands/queries.ts`](./src/commands/queries.ts)           | `WHO` (with WHOX), `WHOIS`, `ISON`, `USERHOST`, `MOTD`, `LUSERS`          |
+| [`src/commands/monitor.ts`](./src/commands/monitor.ts)           | `MONITOR`                                                                 |
+| [`src/commands/setname.ts`](./src/commands/setname.ts)           | `SETNAME`                                                                 |
 | [`src/websocket.ts`](./src/websocket.ts)                         | The IRCv3 WebSocket transport: a WebSocket as a socket of `tcp-hono`      |
 | [`src/index.ts`](./src/index.ts)                                 | Cloudflare Workers: the Worker and the Durable Object                     |
 | [`src/node.ts`](./src/node.ts)                                   | Node.js                                                                   |
@@ -93,17 +95,22 @@ The dependency is pinned to a commit, and pnpm builds it on install. To update i
   - `+k` and `+l`: `JOIN #a,#b key1,key2`. A key is at most `KEYLEN` (23) bytes, without a comma, and is shown in `MODE #channel` only to the members. `-k` takes a parameter, as a mode of type B, and the server sends `-k *`.
   - `+s`: a secret channel is left out of `LIST`, `NAMES`, `WHO`, `WHOIS`, and `TOPIC` for those outside it.
   - `MODES=4`: a `MODE` command applies at most four changes with a parameter, and ignores the others. `MAXLIST=beI:100`: the three lists of a channel have at most 100 masks together, and a mask is at most 100 bytes. A long change is sent in as many `MODE` lines as it takes.
-- Users: `MODE` (`+i`: an invisible user is left out of `NAMES` and `WHO` of a channel for those outside it)
+- Users: `MODE` with `+i` (an invisible user is left out of `NAMES` and `WHO` of a channel for those outside it) and `+B` (bot mode)
 - Messages: `PRIVMSG`, `NOTICE`, `TAGMSG`, `AWAY`, and multiline messages
-- Queries: `WHO`, `WHOIS`, `ISON`, `USERHOST`, `MOTD`, `LUSERS`
-- IRCv3: capability negotiation 3.2, `cap-notify`, `server-time`, `echo-message`, `multi-prefix`, `userhost-in-names`, `extended-join`, `away-notify`, `invite-notify`, `no-implicit-names`, `message-tags`, `message-ids`, `batch`, `labeled-response`, `standard-replies`, `draft/multiline`, `UTF8ONLY`, and the WebSocket transport (Cloudflare Workers only)
+- Queries: `WHO` (with WHOX), `WHOIS`, `ISON`, `USERHOST`, `MOTD`, `LUSERS`, `MONITOR`
+- IRCv3: capability negotiation 3.2, `cap-notify`, `server-time`, `echo-message`, `multi-prefix`, `userhost-in-names`, `extended-join`, `away-notify`, `invite-notify`, `monitor`, `extended-monitor`, `setname`, `bot-mode`, `no-implicit-names`, WHOX, `message-tags`, `message-ids`, `batch`, `labeled-response`, `standard-replies`, `draft/multiline`, `UTF8ONLY`, and the WebSocket transport (Cloudflare Workers only)
   - `message-tags`: the client-only tags of `PRIVMSG`, `NOTICE`, and `TAGMSG` are relayed to the clients that have the capability, whether the sender has it or not, and `TAGMSG` is delivered only to them. The other tags of a client are never relayed. `CLIENTTAGDENY=` says that every client-only tag is allowed. `TAGMSG` is answered like `PRIVMSG`, without `RPL_AWAY`.
   - `msgid`: every `PRIVMSG`, `NOTICE`, `TAGMSG`, and multiline message has one, the same for all its recipients and the echo, and one for each target. It is like a ULID: the time in milliseconds and 80 random bits, so the IDs sort by time and do not repeat after a restart.
   - `labeled-response` is used only when the client also has `batch`, which it depends on. A label longer than 64 bytes is ignored. A message to oneself with `echo-message` comes twice, the delivered one without the label and the echo with it.
   - `draft/multiline` (`max-bytes=4096,max-lines=100` by default): a batch is checked as it comes and delivered when it ends, with the checks of `PRIVMSG` done once for the whole message. A client that does not have the capability, or `batch`, gets the lines one by one, without the blank ones, and with the message ID and the client-only tags on the first one. A batch that breaks a rule gets a `FAIL` and the rest of it is ignored, and so are the lines of a batch that is not open. One batch can be open at a time; it is dropped after `timeout` (30 seconds, checked by `tick()`) and on a disconnection. The other commands are handled as usual while a batch is open. The sender needs `draft/multiline` and `batch`.
   - `UTF8ONLY`: a line that is not UTF-8 gets `FAIL <command> INVALID_UTF8` and is not handled, and the client stays. A `QUIT` is handled without its reason.
   - `invite-notify`: the members of the channel that have it get the `INVITE` too.
-- `CASEMAPPING=ascii`. The lengths of `NICKLEN`, `CHANNELLEN`, `TOPICLEN`, `AWAYLEN`, `KICKLEN`, and `KEYLEN` are in bytes.
+  - WHOX: `WHO <mask> %<fields>[,<token>]` replies with `RPL_WHOSPCRPL` (354). The address (`i`) is `255.255.255.255`, the account (`a`) is `0`, and the op level (`o`) is `n/a`. A token that is not one to three digits is ignored, and `t` is then `0`.
+  - `MONITOR=100`. A client is told when a nickname that it monitors registers, changes to or from it, or quits.
+  - `extended-monitor`: a client that monitors another gets its `AWAY` with `away-notify`, and its `SETNAME` with `setname`, without sharing a channel.
+  - `setname`: `SETNAME` changes the realname, which is at most `NAMELEN` (150) bytes, as is the one of `USER`. A realname that is not valid gets `FAIL SETNAME INVALID_REALNAME`.
+  - Bot mode: `BOT=B`, `RPL_WHOISBOT` (335) in `WHOIS`, `B` in the flags of `WHO`, and the `bot` tag, for the clients with `message-tags`, on every message whose source is a client in bot mode, including the lines of its multiline batches.
+- `CASEMAPPING=ascii`. The lengths of `NICKLEN`, `CHANNELLEN`, `TOPICLEN`, `AWAYLEN`, `KICKLEN`, `KEYLEN`, and `NAMELEN` are in bytes.
 - Lines: a client can send 4096 bytes of tags and 512 bytes of the rest. A longer line gets `ERR_INPUTTOOLONG` and is dropped. A line from the server is at most 512 bytes without the tags: a longer last parameter is cut. The tags that the server adds come first and are far below their 4094 bytes, and the relayed client-only tags are at most 4094 bytes, so a line has at most 8191 bytes of tags.
 - Targets: `PRIVMSG`, `NOTICE`, `TAGMSG`, and `KICK` take up to four, and `NAMES`, `WHO`, and `WHOIS` one, as `TARGMAX` shows. A repeated target counts once.
 - The address of the client is passed to the server, from `CF-Connecting-IP` for a WebSocket and from the Worker for TCP (see below). It is not shown to the other users, who see a cloak (see below).

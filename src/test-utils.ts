@@ -101,17 +101,25 @@ export const setup = (config?: ServerOptions) => {
 let sentinel = 0
 
 /**
- * Send the lines, and return what the client gets in reply. A PING follows them, and the lines
- * up to its PONG are returned, without the tags and the source of each line.
+ * Send the lines, and return what the client gets in reply, as it gets them, with the tags and the
+ * source. A PING follows the lines, and the lines up to its PONG are returned.
  */
-export const exchange = async (client: ReturnType<typeof connect>, ...lines: string[]) => {
+export const transcript = async (client: ReturnType<typeof connect>, ...lines: string[]) => {
   const token = `sentinel${++sentinel}`
   const pong = new RegExp(` PONG \\S+ ${token}$`)
   const start = client.lines.length
   await client.send(...lines, `PING ${token}`)
   await client.waitFor(pong)
-  return client.lines
-    .slice(start)
-    .filter((line) => !pong.test(line))
-    .map((line) => line.replace(/^(@\S+ )?:\S+ /, ''))
+  return client.lines.slice(start).filter((line) => !pong.test(line))
 }
+
+/** A line without its tags and its source. */
+export const strip = (line: string) => line.replace(/^(@\S+ )?:\S+ /, '')
+
+/** Send the lines, and return the replies as `transcript()` does, without the tags and sources. */
+export const exchange = async (client: ReturnType<typeof connect>, ...lines: string[]) =>
+  (await transcript(client, ...lines)).map(strip)
+
+/** The ISUPPORT tokens that a client got. */
+export const isupport = (lines: string[]) =>
+  lines.filter((line) => / 005 /.test(line)).flatMap((line) => line.split(' ').slice(3, -4))

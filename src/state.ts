@@ -23,6 +23,8 @@ import {
   ERR_BANNEDFROMCHAN,
   ERR_CHANNELISFULL,
   ERR_INVITEONLYCHAN,
+  RPL_MONOFFLINE,
+  RPL_MONONLINE,
 } from './numerics.ts'
 import { cloak } from './cloak.ts'
 import { matches } from './masks.ts'
@@ -127,12 +129,16 @@ export const MAX_TARGETS = {
 }
 /** The max length of a channel key, `KEYLEN`. */
 export const KEY_LENGTH = 23
+/** The max length of a realname, `NAMELEN`. */
+export const NAME_LENGTH = 150
 /** The max length of a mask of a list (+b, +e, +I). */
 export const MASK_LENGTH = 100
 /** The max number of entries of the lists of a channel, together, as `MAXLIST` shows it. */
 export const MAX_LIST = 100
 /** The max number of mode changes with a parameter in one MODE command, `MODES`. */
 export const MAX_MODES = 4
+/** The max number of nicknames that a client can monitor, `MONITOR`. */
+export const MAX_MONITOR = 100
 /** The max number of channels that a client is invited to at once. The oldest invite goes first. */
 export const MAX_INVITES = 50
 
@@ -142,6 +148,11 @@ const CHANNEL_PATTERN = /^#[^\s,:\p{Cc}\p{Cf}]+$/u
 
 export const isChannelName = (name: string) =>
   CHANNEL_PATTERN.test(name) && byteLength(name) <= CHANNEL_LENGTH
+
+// NICK_LENGTH characters, which are ASCII, so it is also the length in bytes.
+const NICK_PATTERN = /^[A-Za-z_[\]\\`^{}|][A-Za-z0-9_\-[\]\\`^{}|]{0,29}$/
+
+export const isNickname = (nick: string) => NICK_PATTERN.test(nick)
 
 /** The channel modes of type A, the lists of masks: bans, ban exceptions, and invite exceptions. */
 export type ListMode = 'b' | 'e' | 'I'
@@ -265,10 +276,17 @@ export class Client {
   delayed = false
   /** The version of `CAP LS`, e.g. 302, or 0 if the client has not sent one with a version. */
   capVersion = 0
+  /** User mode `B`: the client is a bot. */
+  bot = false
   /**
    * The channels that the client is invited to, oldest first. `Channel.invited` is the other side.
    */
   invites = new Set<Channel>()
+  /**
+   * The nicknames that the client monitors, as it sent them, by the folded nickname.
+   * `Server.monitors` is the other side.
+   */
+  monitoring = new Map<string, string>()
   /**
    * The messages to this client while its own command is handled. The middleware in `server.ts`
    * opens it and writes it as the response, so they are not pushed. `undefined` otherwise.
@@ -306,7 +324,7 @@ export class Client {
    * must not carry the `label` of the command. The echo of echo-message is the response.
    */
   send(message: IRCMessage, response = true) {
-    message = stamp(message)
+    message = stamp(this.server.fromBot(message))
     if (this.outbox) {
       this.outbox.push({ message, response })
     } else {
@@ -498,6 +516,11 @@ export class Server {
   channels = new Map<string, Channel>()
   /** The number of connections from each address that the runtime told. */
   addresses = new Map<string, number>()
+  /**
+   * The clients that monitor a nickname, by the folded nickname.
+   * `Client.monitoring` is the other side.
+   */
+  monitors = new Map<string, Set<Client>>()
 
   /**
    * The capabilities, with the value that `CAP LS 302` shows, e.g. `sasl` to `PLAIN`.
@@ -508,10 +531,12 @@ export class Server {
     ['cap-notify', undefined],
     ['echo-message', undefined],
     ['extended-join', undefined],
+    ['extended-monitor', undefined],
     ['invite-notify', undefined],
     ['multi-prefix', undefined],
     ['no-implicit-names', undefined],
     ['server-time', undefined],
+    ['setname', undefined],
     ['userhost-in-names', undefined],
     ['message-tags', undefined],
     ['batch', undefined],
@@ -525,6 +550,8 @@ export class Server {
    */
   tagCapabilities = new Map<string, string>([
     ['time', 'server-time'],
+    // The spec of bot mode sends it only with `message-tags`.
+    ['bot', 'message-tags'],
     // ['account', 'account-tag'],
     ['msgid', 'message-tags'],
     ['batch', 'batch'],
@@ -590,6 +617,10 @@ export class Server {
       // Every client-only tag is allowed. The token is empty, which means the same as no token.
       ['CLIENTTAGDENY', ''],
       ['UTF8ONLY', true],
+      ['NAMELEN', String(NAME_LENGTH)],
+      ['MONITOR', String(MAX_MONITOR)],
+      ['WHOX', true],
+      ['BOT', 'B'],
     ])
   }
 
@@ -706,19 +737,101 @@ export class Server {
     channel.invited.delete(client)
   }
 
-  /** Clean up after a client that has gone: its invites. */
+  /** Add a nickname to the list of a client. */
+  monitor(client: Client, nick: string) {
+    const folded = this.fold(nick)
+    client.monitoring.set(folded, nick)
+    const watchers = this.monitors.get(folded) ?? new Set()
+    watchers.add(client)
+    this.monitors.set(folded, watchers)
+  }
+
+  /** Remove a nickname, folded, from the list of a client. */
+  unmonitor(client: Client, folded: string) {
+    client.monitoring.delete(folded)
+    const watchers = this.monitors.get(folded)
+    watchers?.delete(client)
+    if (!watchers?.size) {
+      this.monitors.delete(folded)
+    }
+  }
+
+  /** Tell the clients that monitor a nickname that it is online, as the client, or offline. */
+  notifyMonitors(nick: string, client?: Client) {
+    for (const watcher of this.monitors.get(this.fold(nick)) ?? []) {
+      this.reply(watcher, client ? [RPL_MONONLINE, client.mask] : [RPL_MONOFFLINE, nick])
+    }
+  }
+
+  /**
+   * The clients that get a notification of a change of the client, such as an AWAY or a SETNAME,
+   * which they get with the capability: the ones that share a channel with it, and with
+   * `extended-monitor`, the ones that monitor it. The client itself is not included.
+   */
+  audience(client: Client, capability: string) {
+    const result = new Set<Client>()
+    for (const peer of this.peers(client)) {
+      if (peer.capabilities.has(capability)) {
+        result.add(peer)
+      }
+    }
+    for (const watcher of this.monitors.get(this.fold(client.nick)) ?? []) {
+      if (
+        watcher !== client &&
+        watcher.capabilities.has('extended-monitor') &&
+        watcher.capabilities.has(capability)
+      ) {
+        result.add(watcher)
+      }
+    }
+    return result
+  }
+
+  /** Clean up after a client that has gone: its invites and its list of MONITOR. */
   forget(client: Client) {
     for (const channel of client.invites) {
       channel.invited.delete(client)
     }
     client.invites.clear()
+    for (const folded of client.monitoring.keys()) {
+      this.unmonitor(client, folded)
+    }
+  }
+
+  /**
+   * Send numeric replies to a client outside of its own command, e.g. a notification of MONITOR.
+   * The nickname of the client is inserted, as `c.render()` does for the requesting client.
+   */
+  reply(client: Client, ...lines: Line[]) {
+    for (const [command, ...params] of lines) {
+      client.send({
+        source: this.name,
+        command,
+        params: [...(/^\d{3}$/.test(command) ? [client.nick] : []), ...params.map(String)],
+      })
+    }
+  }
+
+  /**
+   * Add the `bot` tag to a message whose source is a client in bot mode. The client is found by
+   * the nickname of the source when the message is sent, and the source must be its whole mask.
+   */
+  fromBot(message: IRCMessage): IRCMessage {
+    const bang = message.source?.indexOf('!') ?? -1
+    if (bang < 1 || message.tags?.bot !== undefined) {
+      return message
+    }
+    const sender = this.nicks.get(this.fold(message.source!.slice(0, bang)))
+    return sender?.bot && sender.mask === message.source
+      ? { ...message, tags: { ...message.tags, bot: '' } }
+      : message
   }
 
   /**
    * Join the items with spaces into as few strings as possible, so that each one fits as the last
    * parameter of a numeric reply to the client that has the given parameters before it.
    */
-  pack(client: Client, params: string[], items: string[]): string[] {
+  pack(client: Client, params: string[], items: string[], separator = ' '): string[] {
     const head = `:${this.name} 000 ${client.nick} ${params.map((param) => param + ' ').join('')}:`
     const max = MAX_LINE_LENGTH - 2 - byteLength(head)
     const chunks: string[] = []
@@ -727,13 +840,13 @@ export class Server {
     for (const item of items) {
       const size = byteLength(item)
       // The length is checked before the item is added, so a line never goes over.
-      if (chunk && length + 1 + size > max) {
+      if (chunk && length + separator.length + size > max) {
         chunks.push(chunk)
         chunk = ''
         length = 0
       }
-      chunk = chunk ? `${chunk} ${item}` : item
-      length += (length ? 1 : 0) + size
+      chunk = chunk ? `${chunk}${separator}${item}` : item
+      length += (length ? separator.length : 0) + size
     }
     return chunk ? [...chunks, chunk] : chunks
   }
@@ -813,12 +926,13 @@ export class Server {
       return []
     }
     client.registered = true
+    this.notifyMonitors(client.nick, client)
     return [
       [RPL_WELCOME, `Welcome to the ${this.network} Network, ${client.mask}`],
       [RPL_YOURHOST, `Your host is ${this.name}, running version ${VERSION}`],
       [RPL_CREATED, `This server was created ${this.created.toUTCString()}`],
       // The user modes, the channel modes, and the channel modes that have a parameter.
-      [RPL_MYINFO, this.name, VERSION, 'i', 'Ibeiklmnostv', 'Ibeklov'],
+      [RPL_MYINFO, this.name, VERSION, 'Bi', 'Ibeiklmnostv', 'Ibeklov'],
       ...this.isupportLines(),
       ...this.lusers(),
       ...this.motdLines(),

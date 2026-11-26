@@ -8,16 +8,21 @@ import {
   RPL_ENDOFWHOIS,
   RPL_ISON,
   RPL_USERHOST,
+  RPL_WHOISBOT,
   RPL_WHOISCHANNELS,
   RPL_WHOISIDLE,
   RPL_WHOISSERVER,
   RPL_WHOISUSER,
   RPL_WHOREPLY,
+  RPL_WHOSPCRPL,
 } from '../numerics.ts'
 import { MAX_TARGETS, echo, tooMany } from '../state.ts'
 import type { Channel, Client, Env, Line, Server } from '../state.ts'
 
-/** Queries: `WHO`, `WHOIS`, `ISON`, `USERHOST`, `MOTD`, and `LUSERS`. */
+// The fields of WHOX, in the order of RPL_WHOSPCRPL.
+const WHOX_FIELDS = 'tcuihsnfdlaor'
+
+/** Queries: `WHO` (with WHOX), `WHOIS`, `ISON`, `USERHOST`, `MOTD`, and `LUSERS`. */
 export const queries = (server: Server) => {
   const app = new Hono<Env>()
 
@@ -27,23 +32,63 @@ export const queries = (server: Server) => {
     return client?.registered ? client : undefined
   }
 
+  // `WHO <mask>`, or with WHOX, `WHO <mask> %<fields>[,<token>]`, which replies with the fields
+  // that the client asks for, in RPL_WHOSPCRPL.
   app.on('TCP', '/WHO/*', (c) => {
     const { client, message } = c.var
-    const [mask] = message.params
+    const [mask, options] = message.params
     if (!mask) {
       return c.render([ERR_NEEDMOREPARAMS, 'WHO', 'Not enough parameters'])
     }
     const all = client.capabilities.has('multi-prefix')
-    const row = (target: Client, channel?: Channel): Line => [
+    // Here or gone, the highest prefix, or all of them with multi-prefix, and the mode of a bot.
+    const flags = (target: Client, channel?: Channel) =>
+      (target.away === undefined ? 'H' : 'G') +
+      (channel?.prefix(target, all) ?? '') +
+      (target.bot ? 'B' : '')
+    const plain = (target: Client, channel?: Channel): Line => [
       RPL_WHOREPLY,
       channel?.name ?? '*',
       target.user,
       target.host,
       server.name,
       target.nick,
-      (target.away === undefined ? 'H' : 'G') + (channel?.prefix(target, all) ?? ''),
+      flags(target, channel),
       `0 ${target.realname}`,
     ]
+
+    // A token is up to three digits. One that is not is ignored, and `t` without one is `0`.
+    const whox = options?.startsWith('%') ? options.slice(1).split(',') : undefined
+    const fields = whox?.[0] ?? ''
+    const token = /^\d{1,3}$/.test(whox?.[1] ?? '') ? whox![1] : '0'
+    const special = (target: Client, channel?: Channel): Line => {
+      const values: Record<string, string> = {
+        t: token,
+        // A channel only for a channel query, as for plain WHO.
+        c: channel?.name ?? '*',
+        u: target.user,
+        // The address is not disclosed.
+        i: '255.255.255.255',
+        h: target.host,
+        s: server.name,
+        n: target.nick,
+        f: flags(target, channel),
+        d: '0',
+        l: String(Math.floor((Date.now() - target.idle) / 1000)),
+        // Not logged in, as there are no accounts, and no op levels.
+        a: '0',
+        o: 'n/a',
+        r: target.realname,
+      }
+      return [
+        RPL_WHOSPCRPL,
+        ...WHOX_FIELDS.split('')
+          .filter((field) => fields.includes(field))
+          .map((field) => values[field]),
+      ]
+    }
+    const row = whox ? special : plain
+
     const { targets, excess } = server.targets(mask, MAX_TARGETS.WHO)
     const [name = ''] = targets
     const channel = server.channels.get(server.fold(name))
@@ -84,6 +129,9 @@ export const queries = (server: Server) => {
           .map((chunk): Line => [RPL_WHOISCHANNELS, target.nick, chunk]),
         [RPL_WHOISSERVER, target.nick, server.name, server.network],
         ...(target.away !== undefined ? [[RPL_AWAY, target.nick, target.away] satisfies Line] : []),
+        ...(target.bot
+          ? [[RPL_WHOISBOT, target.nick, `is a Bot on ${server.network}`] satisfies Line]
+          : []),
         [
           RPL_WHOISIDLE,
           target.nick,

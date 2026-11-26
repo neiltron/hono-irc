@@ -5,8 +5,10 @@ import { channels } from './commands/channels.ts'
 import { messages } from './commands/messages.ts'
 import { modes } from './commands/modes.ts'
 import { expire, multiline } from './commands/multiline.ts'
+import { monitor } from './commands/monitor.ts'
 import { queries } from './commands/queries.ts'
 import { registration } from './commands/registration.ts'
+import { setname } from './commands/setname.ts'
 import { flood } from './flood.ts'
 import { ERR_INPUTTOOLONG, ERR_NOTREGISTERED, ERR_UNKNOWNCOMMAND } from './numerics.ts'
 import { INPUT_TOO_LONG, byteLength, format, irc, parse, parseTags } from './protocol.ts'
@@ -234,6 +236,8 @@ export const createServer = (config: ServerOptions = {}) => {
   app.route('/', messages(server))
   app.route('/', modes(server))
   app.route('/', queries(server))
+  app.route('/', monitor(server))
+  app.route('/', setname(server))
 
   // The decoder yields this in place of a line that is too long. The line is dropped and the
   // connection stays open.
@@ -286,7 +290,7 @@ export const createServer = (config: ServerOptions = {}) => {
       server.clients.delete(connection)
       // A batch that the client has not closed is dropped.
       client.inbound = undefined
-      // Its invites.
+      // Its invites and its list of MONITOR, before the others are told that it has gone.
       server.forget(client)
       if (client.ip !== undefined) {
         const count = (server.addresses.get(client.ip) ?? 1) - 1
@@ -296,11 +300,15 @@ export const createServer = (config: ServerOptions = {}) => {
           server.addresses.delete(client.ip)
         }
       }
-      if (server.nicks.get(server.fold(client.nick)) === client) {
-        server.nicks.delete(server.fold(client.nick))
-      }
+      // The nickname is freed after the QUIT, so the QUIT of a bot still has the `bot` tag.
       for (const peer of server.peers(client)) {
         peer.send(msg(client.mask, 'QUIT', client.quit ?? 'Connection closed'))
+      }
+      if (server.nicks.get(server.fold(client.nick)) === client) {
+        server.nicks.delete(server.fold(client.nick))
+        if (client.registered) {
+          server.notifyMonitors(client.nick)
+        }
       }
       for (const channel of client.channels) {
         server.leave(client, channel)

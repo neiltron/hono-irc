@@ -160,6 +160,9 @@ await step('registration and ISUPPORT', async () => {
     INVEX: true,
     MAXLIST: 'beI:100',
     MODES: '4',
+    MONITOR: '100',
+    WHOX: true,
+    BOT: 'B',
   })) {
     assert.equal(alice.network.supports(token), value, token)
   }
@@ -298,11 +301,14 @@ await step('draft/multiline from a raw client, and its fallback to irc-framework
   await quit
 })
 
-await step('mode, and multi-prefix in WHO', async () => {
+await step('mode, and multi-prefix in WHOX', async () => {
   const mode = once(bob, 'mode')
   alice.raw('MODE #hono +v alice')
   assert.deepEqual((await mode).modes, [{ mode: '+v', param: 'alice' }])
+  // With WHOX in ISUPPORT, irc-framework asks for the fields that it wants, with a token.
+  const whox = line(alice, / 354 alice \d+ #hono /)
   const who = await new Promise((resolve) => alice.who('#hono', resolve))
+  await whox
   const self = who.users.find((u) => u.nick === 'alice')
   // `H@+`: all the prefixes, as alice has multi-prefix, which irc-framework asks for.
   assert.deepEqual(self.channel_modes, ['o', 'v'])
@@ -469,6 +475,32 @@ await step('away-notify', async () => {
   const away = once(alice, 'away')
   bob.raw('AWAY :lunch')
   assert.equal((await away).message, 'lunch')
+})
+
+await step('MONITOR', async () => {
+  const offline = once(alice, 'users offline')
+  alice.addMonitor('erin,robert')
+  const online = once(alice, 'users online')
+  assert.deepEqual((await offline).nicks, ['erin'])
+  assert.deepEqual((await online).nicks, ['robert'])
+  const list = await new Promise((resolve) => alice.monitorlist(resolve))
+  assert.deepEqual(list.nicks, ['erin', 'robert'])
+  const coming = once(alice, 'users online', (e) => e.nicks.includes('erin'))
+  const erin = await connect('erin')
+  await coming
+  const going = once(alice, 'users offline', (e) => e.nicks.includes('erin'))
+  erin.quit('bye')
+  await going
+})
+
+await step('bot mode in WHOIS and WHO', async () => {
+  const set = line(bob, / MODE robert :?\+B$/)
+  bob.raw('MODE robert +B')
+  await set
+  const whois = await new Promise((resolve) => alice.whois('robert', resolve))
+  assert.match(whois.bot, /is a Bot/)
+  const who = await new Promise((resolve) => alice.who('robert', resolve))
+  assert.equal(who.users[0].bot, true)
 })
 
 await step('quit', async () => {

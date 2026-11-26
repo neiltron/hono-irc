@@ -113,10 +113,8 @@ export const messages = (server: Server) => {
     // The others are told only of a change.
     if (away !== client.away) {
       client.away = away
-      for (const peer of server.peers(client)) {
-        if (peer.capabilities.has('away-notify')) {
-          peer.send(msg(client.mask, 'AWAY', ...(away ? [away] : [])))
-        }
+      for (const peer of server.audience(client, 'away-notify')) {
+        peer.send(msg(client.mask, 'AWAY', ...(away ? [away] : [])))
       }
     }
     return away

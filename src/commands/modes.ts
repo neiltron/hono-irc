@@ -58,6 +58,9 @@ const modestring = (changes: Change[]) => {
   return [modes, ...changes.flatMap((change) => change.arg ?? [])]
 }
 
+/** User modes: `i` (invisible) and `B` (bot). */
+const userModes = (client: Client) => '+' + (client.bot ? 'B' : '') + (client.invisible ? 'i' : '')
+
 /** Modes: `MODE` for a user and for a channel. */
 export const modes = (server: Server) => {
   const app = new Hono<Env>()
@@ -140,23 +143,32 @@ export const modes = (server: Server) => {
           : c.render([ERR_NOSUCHNICK, echo(targetName), 'No such nick/channel'])
       }
       if (!modes) {
-        return c.render([RPL_UMODEIS, client.invisible ? '+i' : '+'])
+        return c.render([RPL_UMODEIS, userModes(client)])
       }
       // The known modes are applied, and the unknown ones get one ERR_UMODEUNKNOWNFLAG after.
       let adding = true
       let unknown = false
-      const before = client.invisible
+      const before = { i: client.invisible, B: client.bot }
       for (const mode of modes) {
         if (mode === '+' || mode === '-') {
           adding = mode === '+'
         } else if (mode === 'i') {
           client.invisible = adding
+        } else if (mode === 'B') {
+          client.bot = adding
         } else {
           unknown = true
         }
       }
-      if (client.invisible !== before) {
-        client.send(msg(client.nick, 'MODE', client.nick, (client.invisible ? '+' : '-') + 'i'))
+      const changes: Change[] = []
+      if (client.bot !== before.B) {
+        changes.push({ adding: client.bot, mode: 'B' })
+      }
+      if (client.invisible !== before.i) {
+        changes.push({ adding: client.invisible, mode: 'i' })
+      }
+      if (changes.length) {
+        client.send(msg(client.nick, 'MODE', client.nick, ...modestring(changes)))
       }
       return c.render(
         ...(unknown ? [[ERR_UMODEUNKNOWNFLAG, 'Unknown MODE flag'] satisfies Line] : [])

@@ -9,12 +9,10 @@ import {
   ERR_NONICKNAMEGIVEN,
   ERR_NOORIGIN,
 } from '../numerics.ts'
-import { MAX_LINE_LENGTH, format } from '../protocol.ts'
-import { echo, msg } from '../state.ts'
+import { MAX_LINE_LENGTH, format, truncate } from '../protocol.ts'
+import { NAME_LENGTH, echo, isNickname, msg } from '../state.ts'
 import type { Env, Line, Server } from '../state.ts'
 
-// NICK_LENGTH characters, which are ASCII, so it is also the length in bytes.
-const NICK_PATTERN = /^[A-Za-z_[\]\\`^{}|][A-Za-z0-9_\-[\]\\`^{}|]{0,29}$/
 // A `CAP LS` reply is split into lines of this many bytes of capabilities.
 const CAP_LS_LENGTH = 400
 
@@ -113,7 +111,7 @@ export const registration = (server: Server) => {
     if (!nick) {
       return c.render([ERR_NONICKNAMEGIVEN, 'No nickname given'])
     }
-    if (!NICK_PATTERN.test(nick)) {
+    if (!isNickname(nick)) {
       return c.render([ERR_ERRONEUSNICKNAME, echo(nick), 'Erroneous nickname'])
     }
     const owner = server.nicks.get(server.fold(nick))
@@ -141,9 +139,15 @@ export const registration = (server: Server) => {
         target.send(msg(client.mask, 'NICK', nick))
       }
     }
+    const previous = client.nick
     server.nicks.delete(server.fold(client.nick))
     server.nicks.set(server.fold(nick), client)
     client.nick = nick
+    // A change of case is the same nickname for MONITOR.
+    if (client.registered && server.fold(previous) !== server.fold(nick)) {
+      server.notifyMonitors(previous)
+      server.notifyMonitors(nick, client)
+    }
     return c.render(...server.register(client))
   })
 
@@ -158,7 +162,7 @@ export const registration = (server: Server) => {
     }
     // The username is not verified with Ident.
     client.user = '~' + (user.replace(/[^\w.-]/g, '').slice(0, 10) || 'user')
-    client.realname = realname
+    client.realname = truncate(realname, NAME_LENGTH)
     return c.render(...server.register(client))
   })
 
