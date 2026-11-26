@@ -154,6 +154,17 @@ await step('registration and ISUPPORT', async () => {
   assert.ok(alice.network.supportsTag('typing'), 'CLIENTTAGDENY allows every client-only tag')
   assert.equal(alice.network.supports('AWAYLEN'), '300')
   assert.equal(alice.network.supports('CASEMAPPING'), 'ascii')
+  assert.deepEqual(alice.network.supports('CHANMODES'), ['beI', 'k', 'l', 'imnst'])
+  for (const [token, value] of Object.entries({
+    EXCEPTS: true,
+    INVEX: true,
+    MAXLIST: 'beI:100',
+    MODES: '4',
+  })) {
+    assert.equal(alice.network.supports(token), value, token)
+  }
+  // irc-framework asks for invite-notify when the server has it.
+  assert.ok(alice.network.cap.enabled.includes('invite-notify'))
 })
 
 await step('join and names', async () => {
@@ -314,6 +325,97 @@ await step('ISON and USERHOST', async () => {
   const userhost = line(alice, / 302 alice /)
   alice.raw('USERHOST robert')
   assert.match(await userhost, / 302 alice :?robert=\+~bob@\S+$/)
+})
+
+await step('invite-only, INVITE, and invite-notify', async () => {
+  let names = once(alice, 'userlist', (e) => e.channel === '#priv')
+  alice.join('#priv')
+  await names
+  const mode = once(alice, 'mode', (e) => e.target === '#priv')
+  alice.raw('MODE #priv +i')
+  assert.deepEqual((await mode).modes, [{ mode: '+i', param: null }])
+  const refused = once(bob, 'irc error', (e) => e.error === 'invite_only_channel')
+  bob.join('#priv')
+  assert.equal((await refused).channel, '#priv')
+  const invited = once(alice, 'invited')
+  const invite = once(bob, 'invite')
+  alice.invite('#priv', 'robert')
+  assert.deepEqual([(await invited).nick, (await invited).channel], ['robert', '#priv'])
+  assert.deepEqual([(await invite).nick, (await invite).invited], ['alice', 'robert'])
+  names = once(bob, 'userlist', (e) => e.channel === '#priv')
+  bob.join('#priv')
+  assert.deepEqual(users(await names), ['oalice', 'robert'])
+})
+
+await step('key and limit, parsed by CHANMODES', async () => {
+  const modes = once(bob, 'mode', (e) => e.target === '#priv')
+  alice.raw('MODE #priv -i+kl secret 5')
+  assert.deepEqual((await modes).modes, [
+    { mode: '-i', param: null },
+    { mode: '+k', param: 'secret' },
+    { mode: '+l', param: '5' },
+  ])
+  const parted = once(bob, 'part', (e) => e.channel === '#priv')
+  bob.part('#priv')
+  await parted
+  const refused = once(bob, 'irc error', (e) => e.error === 'bad_channel_key')
+  bob.join('#priv', 'wrong')
+  assert.equal((await refused).channel, '#priv')
+  const joined = once(bob, 'join', (e) => e.channel === '#priv' && e.nick === 'robert')
+  bob.join('#priv', 'secret')
+  await joined
+  const removed = once(bob, 'mode', (e) => e.target === '#priv')
+  alice.raw('MODE #priv -lk *')
+  assert.deepEqual((await removed).modes, [
+    { mode: '-l', param: null },
+    { mode: '-k', param: '*' },
+  ])
+})
+
+await step('bans, the ban list, and exceptions', async () => {
+  const banned = once(bob, 'mode', (e) => e.target === '#priv')
+  alice.ban('#priv', 'robert')
+  assert.deepEqual((await banned).modes, [{ mode: '+b', param: 'robert!*@*' }])
+  const list = await new Promise((resolve) => alice.banlist('#priv', resolve))
+  assert.deepEqual(
+    list.bans.map((ban) => [ban.banned, ban.banned_by.split('!')[0]]),
+    [['robert!*@*', 'alice']]
+  )
+  // A banned member can not speak or change its nickname.
+  const quiet = once(bob, 'irc error', (e) => e.error === 'cannot_send_to_channel')
+  bob.say('#priv', 'can you hear me?')
+  await quiet
+  const nick = line(bob, / 435 robert /)
+  bob.changeNick('bobby')
+  await nick
+  const kicked = once(bob, 'kick', (e) => e.channel === '#priv')
+  alice.raw('KICK #priv robert')
+  await kicked
+  const refused = once(bob, 'irc error', (e) => e.error === 'banned_from_channel')
+  bob.join('#priv')
+  await refused
+  const excepted = once(alice, 'mode', (e) => e.target === '#priv')
+  alice.raw('MODE #priv +e *!~bob@*')
+  await excepted
+  const joined = once(bob, 'join', (e) => e.channel === '#priv' && e.nick === 'robert')
+  bob.join('#priv')
+  await joined
+  const parted = once(bob, 'part', (e) => e.channel === '#priv')
+  bob.part('#priv')
+  await parted
+})
+
+await step('secret channels', async () => {
+  const mode = once(alice, 'mode', (e) => e.target === '#priv')
+  alice.raw('MODE #priv +s')
+  await mode
+  const listed = []
+  const done = once(bob, 'channel list end')
+  bob.on('channel list', (channels) => listed.push(...channels.map((c) => c.channel)))
+  bob.list()
+  await done
+  assert.ok(listed.includes('#hono'), 'the public channel is listed')
+  assert.ok(!listed.includes('#priv'), 'the secret channel is not')
 })
 
 await step('too many targets and a line that is too long', async () => {

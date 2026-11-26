@@ -19,8 +19,14 @@ import {
   RPL_YOURHOST,
   ERR_NOMOTD,
   ERR_TOOMANYTARGETS,
+  ERR_BADCHANNELKEY,
+  ERR_BANNEDFROMCHAN,
+  ERR_CHANNELISFULL,
+  ERR_INVITEONLYCHAN,
 } from './numerics.ts'
 import { cloak } from './cloak.ts'
+import { matches } from './masks.ts'
+import type { Glob } from './masks.ts'
 import { MAX_LINE_LENGTH, MAX_TAG_DATA, byteLength, format, tagsLength } from './protocol.ts'
 import type { IRCMessage } from './protocol.ts'
 
@@ -119,6 +125,16 @@ export const MAX_TARGETS = {
   WHO: 1,
   WHOIS: 1,
 }
+/** The max length of a channel key, `KEYLEN`. */
+export const KEY_LENGTH = 23
+/** The max length of a mask of a list (+b, +e, +I). */
+export const MASK_LENGTH = 100
+/** The max number of entries of the lists of a channel, together, as `MAXLIST` shows it. */
+export const MAX_LIST = 100
+/** The max number of mode changes with a parameter in one MODE command, `MODES`. */
+export const MAX_MODES = 4
+/** The max number of channels that a client is invited to at once. The oldest invite goes first. */
+export const MAX_INVITES = 50
 
 // No whitespace, commas, colons, control characters such as BEL, or format characters,
 // such as the bidirectional overrides and the zero-width ones, which can make two names look alike.
@@ -126,6 +142,12 @@ const CHANNEL_PATTERN = /^#[^\s,:\p{Cc}\p{Cf}]+$/u
 
 export const isChannelName = (name: string) =>
   CHANNEL_PATTERN.test(name) && byteLength(name) <= CHANNEL_LENGTH
+
+/** The channel modes of type A, the lists of masks: bans, ban exceptions, and invite exceptions. */
+export type ListMode = 'b' | 'e' | 'I'
+/** An entry of a list. `glob` is the folded mask, compiled. */
+export type ListEntry = { mask: string; by: string; at: number; glob: Glob }
+
 export const PREFIXES = { o: '@', v: '+' } as const
 export type Rank = keyof typeof PREFIXES
 
@@ -243,6 +265,10 @@ export class Client {
   delayed = false
   /** The version of `CAP LS`, e.g. 302, or 0 if the client has not sent one with a version. */
   capVersion = 0
+  /**
+   * The channels that the client is invited to, oldest first. `Channel.invited` is the other side.
+   */
+  invites = new Set<Channel>()
   /**
    * The messages to this client while its own command is handled. The middleware in `server.ts`
    * opens it and writes it as the response, so they are not pushed. `undefined` otherwise.
@@ -367,13 +393,68 @@ export class Channel {
     this.name = name
   }
 
-  /** Whether the client may send a message to the channel: PRIVMSG, NOTICE, TAGMSG, or multiline. */
-  canSend(client: Client) {
+  // The modes of type D are in `modes`: i, m, n, s, and t. The others are below.
+
+  /** The key (+k). */
+  key?: string
+  /** The limit of members (+l). */
+  limit?: number
+  /** The lists of masks (+b, +e, +I). */
+  lists: Record<ListMode, ListEntry[]> = { b: [], e: [], I: [] }
+  /** The clients that are invited, until they join. `Client.invites` is the other side. */
+  invited = new Set<Client>()
+
+  /** Whether the client matches a mask of a list. */
+  matches(mode: ListMode, client: Client) {
+    const mask = client.server.fold(client.mask)
+    return this.lists[mode].some((entry) => matches(entry.glob, mask))
+  }
+
+  /** Whether the client is banned (+b), and not excepted from the bans (+e). */
+  banned(client: Client) {
+    return this.matches('b', client) && !this.matches('e', client)
+  }
+
+  /** Whether the client is a member that is an operator or has voice, which a ban does not stop. */
+  privileged(client: Client) {
     const ranks = this.members.get(client)
-    return !(
-      (this.modes.has('n') && !ranks) ||
-      (this.modes.has('m') && !ranks?.has('o') && !ranks?.has('v'))
-    )
+    return !!ranks && (ranks.has('o') || ranks.has('v'))
+  }
+
+  /** Whether the client sees the channel: a secret one (+s) only from inside. */
+  visibleTo(client: Client) {
+    return !this.modes.has('s') || this.members.has(client)
+  }
+
+  /**
+   * Whether the client may join with the key, or the error that stops it. An invite lets the client
+   * in in spite of +i, +k, and +l, but not of a ban.
+   */
+  canJoin(client: Client, key?: string): Line | undefined {
+    const invited = this.invited.has(client)
+    if (this.banned(client)) {
+      return [ERR_BANNEDFROMCHAN, this.name, 'Cannot join channel (+b)']
+    }
+    if (this.modes.has('i') && !invited && !this.matches('I', client)) {
+      return [ERR_INVITEONLYCHAN, this.name, 'Cannot join channel (+i)']
+    }
+    if (this.key !== undefined && key !== this.key && !invited) {
+      return [ERR_BADCHANNELKEY, this.name, 'Cannot join channel (+k)']
+    }
+    if (this.limit !== undefined && this.members.size >= this.limit && !invited) {
+      return [ERR_CHANNELISFULL, this.name, 'Cannot join channel (+l)']
+    }
+  }
+
+  /**
+   * Whether the client may send a message to the channel: from outside only without +n, only an
+   * operator or a member with voice with +m, and not while it is banned, unless it is one of them.
+   */
+  canSend(client: Client) {
+    if (this.modes.has('n') && !this.members.has(client)) {
+      return false
+    }
+    return this.privileged(client) || (!this.modes.has('m') && !this.banned(client))
   }
 
   /** Send a message to every member, including the sender. */
@@ -427,7 +508,9 @@ export class Server {
     ['cap-notify', undefined],
     ['echo-message', undefined],
     ['extended-join', undefined],
+    ['invite-notify', undefined],
     ['multi-prefix', undefined],
+    ['no-implicit-names', undefined],
     ['server-time', undefined],
     ['userhost-in-names', undefined],
     ['message-tags', undefined],
@@ -483,7 +566,13 @@ export class Server {
     this.isupport = new Map<string, string | true>([
       ['CASEMAPPING', 'ascii'],
       ['CHANTYPES', '#'],
-      ['CHANMODES', ',,,mnt'],
+      // The lists, the key, the limit, and the modes without a parameter.
+      ['CHANMODES', 'beI,k,l,imnst'],
+      ['EXCEPTS', true],
+      ['INVEX', true],
+      ['MAXLIST', `beI:${MAX_LIST}`],
+      ['MODES', String(MAX_MODES)],
+      ['KEYLEN', String(KEY_LENGTH)],
       ['PREFIX', '(ov)@+'],
       ['NICKLEN', String(NICK_LENGTH)],
       ['CHANNELLEN', String(CHANNEL_LENGTH)],
@@ -576,9 +665,15 @@ export class Server {
     return result
   }
 
-  /** The members of a channel that a client can see: an invisible one only from inside. */
+  /**
+   * The members of a channel that a client can see: an invisible one only from inside, and none of
+   * a secret channel from outside.
+   */
   visibleMembers(client: Client, channel: Channel) {
     const inside = channel.members.has(client)
+    if (!channel.visibleTo(client)) {
+      return []
+    }
     return [...channel.members.keys()].filter((member) => inside || !member.invisible)
   }
 
@@ -587,7 +682,36 @@ export class Server {
     client.channels.delete(channel)
     if (!channel.members.size) {
       this.channels.delete(this.fold(channel.name))
+      // An invite is to this channel, not to another one of the same name later.
+      for (const invited of channel.invited) {
+        invited.invites.delete(channel)
+      }
+      channel.invited.clear()
     }
+  }
+
+  /** Invite a client to a channel. A client keeps the last MAX_INVITES invites. */
+  invite(client: Client, channel: Channel) {
+    client.invites.delete(channel)
+    client.invites.add(channel)
+    channel.invited.add(client)
+    if (client.invites.size > MAX_INVITES) {
+      const [oldest] = client.invites
+      this.uninvite(client, oldest)
+    }
+  }
+
+  uninvite(client: Client, channel: Channel) {
+    client.invites.delete(channel)
+    channel.invited.delete(client)
+  }
+
+  /** Clean up after a client that has gone: its invites. */
+  forget(client: Client) {
+    for (const channel of client.invites) {
+      channel.invited.delete(client)
+    }
+    client.invites.clear()
   }
 
   /**
@@ -629,10 +753,12 @@ export class Server {
     const entries = this.visibleMembers(client, channel).map(
       (member) => channel.prefix(member, all) + (userhost ? member.mask : member.nick)
     )
+    // `@` is a secret channel and `=` a public one.
+    const symbol = channel.modes.has('s') ? '@' : '='
     return [
-      ...this.pack(client, ['=', channel.name], entries).map((chunk): Line => [
+      ...this.pack(client, [symbol, channel.name], entries).map((chunk): Line => [
         RPL_NAMREPLY,
-        '=',
+        symbol,
         channel.name,
         chunk,
       ]),
@@ -691,7 +817,8 @@ export class Server {
       [RPL_WELCOME, `Welcome to the ${this.network} Network, ${client.mask}`],
       [RPL_YOURHOST, `Your host is ${this.name}, running version ${VERSION}`],
       [RPL_CREATED, `This server was created ${this.created.toUTCString()}`],
-      [RPL_MYINFO, this.name, VERSION, 'i', 'mntov'],
+      // The user modes, the channel modes, and the channel modes that have a parameter.
+      [RPL_MYINFO, this.name, VERSION, 'i', 'Ibeiklmnostv', 'Ibeklov'],
       ...this.isupportLines(),
       ...this.lusers(),
       ...this.motdLines(),

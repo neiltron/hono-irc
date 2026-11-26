@@ -4,10 +4,15 @@ import {
   ERR_CHANOPRIVSNEEDED,
   ERR_NEEDMOREPARAMS,
   ERR_NOSUCHCHANNEL,
+  ERR_NOSUCHNICK,
   ERR_NOTONCHANNEL,
   ERR_TOOMANYCHANNELS,
   ERR_USERNOTINCHANNEL,
+  ERR_USERONCHANNEL,
+  RPL_ENDOFINVITELIST,
   RPL_ENDOFNAMES,
+  RPL_INVITELIST,
+  RPL_INVITING,
   RPL_LIST,
   RPL_LISTEND,
   RPL_LISTSTART,
@@ -26,7 +31,7 @@ import {
 } from '../state.ts'
 import type { Env, Line, Server } from '../state.ts'
 
-/** Channels: `JOIN`, `PART`, `TOPIC`, `NAMES`, `LIST`, and `KICK`. */
+/** Channels: `JOIN`, `PART`, `TOPIC`, `NAMES`, `LIST`, `KICK`, and `INVITE`. */
 export const channels = (server: Server) => {
   const app = new Hono<Env>()
 
@@ -34,7 +39,7 @@ export const channels = (server: Server) => {
 
   app.on('TCP', '/JOIN/*', (c) => {
     const { client, message } = c.var
-    const [list] = message.params
+    const [list, keyList] = message.params
     if (!list) {
       return c.render([ERR_NEEDMOREPARAMS, 'JOIN', 'Not enough parameters'])
     }
@@ -48,8 +53,10 @@ export const channels = (server: Server) => {
     }
 
     // The replies are rendered for each channel, so the client gets the JOIN of a channel
-    // followed by its topic and names, before the next channel. The keys are ignored.
-    for (const channelName of list.split(',')) {
+    // followed by its topic and names, before the next channel. The first key is for the first
+    // channel, and so on.
+    const keys = keyList?.split(',') ?? []
+    for (const [i, channelName] of list.split(',').entries()) {
       if (!isChannelName(channelName)) {
         c.render([ERR_NOSUCHCHANNEL, echo(channelName), 'No such channel'])
         continue
@@ -62,8 +69,14 @@ export const channels = (server: Server) => {
         c.render([ERR_TOOMANYCHANNELS, channelName, 'You have joined too many channels'])
         continue
       }
+      const refused = channel?.canJoin(client, keys[i] || undefined)
+      if (refused) {
+        c.render(refused)
+        continue
+      }
       if (!channel) {
-        // The server is full of channels. ERR_CHANNELISFULL is the reply to JOIN for a limit.
+        // The server is full of channels. ERR_CHANNELISFULL is the reply to JOIN for a limit, as
+        // for +l, with a text that tells the two apart.
         if (server.channels.size >= server.maxChannels) {
           c.render([ERR_CHANNELISFULL, channelName, 'Cannot join channel (too many channels)'])
           continue
@@ -74,6 +87,8 @@ export const channels = (server: Server) => {
       // The first member is the operator.
       channel.members.set(client, new Set(channel.members.size ? [] : ['o']))
       client.channels.add(channel)
+      // An invite is used up.
+      server.uninvite(client, channel)
 
       for (const member of channel.members.keys()) {
         if (member.capabilities.has('extended-join')) {
@@ -89,7 +104,9 @@ export const channels = (server: Server) => {
       if (channel.topic) {
         c.render(...server.topic(channel))
       }
-      c.render(...server.names(client, channel))
+      if (!client.capabilities.has('no-implicit-names')) {
+        c.render(...server.names(client, channel))
+      }
     }
     return c.render()
   })
@@ -128,10 +145,11 @@ export const channels = (server: Server) => {
     if (!channel) {
       return c.render([ERR_NOSUCHCHANNEL, echo(channelName), 'No such channel'])
     }
-    if (text === undefined) {
+    const ranks = channel.members.get(client)
+    // The topic of a secret channel is only for its members.
+    if (text === undefined && channel.visibleTo(client)) {
       return c.render(...server.topic(channel))
     }
-    const ranks = channel.members.get(client)
     if (!ranks) {
       return c.render([ERR_NOTONCHANNEL, channel.name, "You're not on that channel"])
     }
@@ -171,12 +189,14 @@ export const channels = (server: Server) => {
   app.on('TCP', '/LIST/*', (c) => {
     return c.render(
       [RPL_LISTSTART, 'Channel', 'Users  Name'],
-      ...[...server.channels.values()].map((channel): Line => [
-        RPL_LIST,
-        channel.name,
-        channel.members.size,
-        channel.topic?.text ?? '',
-      ]),
+      ...[...server.channels.values()]
+        .filter((channel) => channel.visibleTo(c.var.client))
+        .map((channel): Line => [
+          RPL_LIST,
+          channel.name,
+          channel.members.size,
+          channel.topic?.text ?? '',
+        ]),
       [RPL_LISTEND, 'End of /LIST']
     )
   })
@@ -211,6 +231,49 @@ export const channels = (server: Server) => {
       server.leave(target, channel)
     }
     return c.render(...tooMany(excess))
+  })
+
+  // `INVITE nick #channel`, or `INVITE` for the channels that the client is invited to.
+  app.on('TCP', '/INVITE/*', (c) => {
+    const { client, message } = c.var
+    const [nick, channelName] = message.params
+    if (!message.params.length) {
+      return c.render(
+        ...[...client.invites].map((channel): Line => [RPL_INVITELIST, channel.name]),
+        [RPL_ENDOFINVITELIST, 'End of /INVITE list']
+      )
+    }
+    if (!nick || !channelName) {
+      return c.render([ERR_NEEDMOREPARAMS, 'INVITE', 'Not enough parameters'])
+    }
+    const target = server.nicks.get(server.fold(nick))
+    if (!target?.registered) {
+      return c.render([ERR_NOSUCHNICK, echo(nick), 'No such nick/channel'])
+    }
+    const channel = server.channels.get(server.fold(channelName))
+    if (!channel) {
+      return c.render([ERR_NOSUCHCHANNEL, echo(channelName), 'No such channel'])
+    }
+    const ranks = channel.members.get(client)
+    if (!ranks) {
+      return c.render([ERR_NOTONCHANNEL, channel.name, "You're not on that channel"])
+    }
+    if (channel.modes.has('i') && !ranks.has('o')) {
+      return c.render([ERR_CHANOPRIVSNEEDED, channel.name, "You're not channel operator"])
+    }
+    if (channel.members.has(target)) {
+      return c.render([ERR_USERONCHANNEL, target.nick, channel.name, 'is already on channel'])
+    }
+    server.invite(target, channel)
+    const invite = msg(client.mask, 'INVITE', target.nick, channel.name)
+    target.send(invite)
+    // invite-notify: the other members with the capability are told too.
+    for (const member of channel.members.keys()) {
+      if (member !== client && member.capabilities.has('invite-notify')) {
+        member.send(invite)
+      }
+    }
+    return c.render([RPL_INVITING, target.nick, channel.name])
   })
 
   return app

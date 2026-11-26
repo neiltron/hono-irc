@@ -37,8 +37,9 @@ app.on('TCP', '/PRIVMSG/:targets/:text', (c) => { ... })
 | [`src/server.ts`](./src/server.ts)                               | `createServer()`. A Hono app that does not depend on a runtime            |
 | [`src/flood.ts`](./src/flood.ts)                                 | The flood control: a token bucket and fake lag for each connection        |
 | [`src/cloak.ts`](./src/cloak.ts)                                 | The cloaks: the hosts shown in place of the addresses, with HMAC-SHA-256  |
+| [`src/masks.ts`](./src/masks.ts)                                 | The masks of bans and exceptions: `nick!user@host` with `*` and `?`       |
 | [`src/commands/registration.ts`](./src/commands/registration.ts) | `CAP`, `NICK`, `USER`, `PASS`, `PING`, `PONG`, `QUIT`                     |
-| [`src/commands/channels.ts`](./src/commands/channels.ts)         | `JOIN`, `PART`, `TOPIC`, `NAMES`, `LIST`, `KICK`                          |
+| [`src/commands/channels.ts`](./src/commands/channels.ts)         | `JOIN`, `PART`, `TOPIC`, `NAMES`, `LIST`, `KICK`, `INVITE`                |
 | [`src/commands/messages.ts`](./src/commands/messages.ts)         | `PRIVMSG`, `NOTICE`, `TAGMSG`, `AWAY`                                     |
 | [`src/commands/multiline.ts`](./src/commands/multiline.ts)       | `BATCH` from a client: the batches of `draft/multiline`                   |
 | [`src/commands/modes.ts`](./src/commands/modes.ts)               | `MODE`                                                                    |
@@ -85,17 +86,24 @@ The dependency is pinned to a commit, and pnpm builds it on install. To update i
 ## What is implemented
 
 - Registration: `CAP`, `NICK`, `USER`, `PASS` (not checked), `PING`, `PONG`, `QUIT`
-- Channels: `JOIN`, `PART`, `TOPIC`, `NAMES`, `LIST`, `KICK`, `MODE` (`+o`, `+v`, `+m`, `+n`, `+t`)
+- Channels: `JOIN` (with keys), `PART`, `TOPIC`, `NAMES`, `LIST`, `KICK`, `INVITE`, and `MODE` with `CHANMODES=beI,k,l,imnst` and `PREFIX=(ov)@+`:
+  - `+b` bans, `+e` ban exceptions, and `+I` invite exceptions: masks `nick!user@host` with `*` and `?`, in ASCII case, kept in their full form (`bob` is `bob!*@*`, `*@host` is `*!*@host`). A backslash escapes `*`, `?`, and `\`. `MODE #channel b` lists the bans to anyone who can see the channel, and `e` and `I` only to its operators.
+  - A banned client can not join (`ERR_BANNEDFROMCHAN`), send to the channel from inside or outside, or change its nickname while it is in the channel (`ERR_BANNICKCHANGE`, 435), unless it is an operator or has voice there. An exception (`+e`) cancels a ban.
+  - `+i`: only an invited client, or one that matches an invite exception, can join. Any member can invite to a channel without `+i`, and only an operator to one with it. An invite lets the client in in spite of `+i`, `+k`, and `+l`, but not of a ban, and is used up when it joins. `INVITE` without parameters lists the invites of the client. A client keeps its last 50 invites, which go away with it and with the channel.
+  - `+k` and `+l`: `JOIN #a,#b key1,key2`. A key is at most `KEYLEN` (23) bytes, without a comma, and is shown in `MODE #channel` only to the members. `-k` takes a parameter, as a mode of type B, and the server sends `-k *`.
+  - `+s`: a secret channel is left out of `LIST`, `NAMES`, `WHO`, `WHOIS`, and `TOPIC` for those outside it.
+  - `MODES=4`: a `MODE` command applies at most four changes with a parameter, and ignores the others. `MAXLIST=beI:100`: the three lists of a channel have at most 100 masks together, and a mask is at most 100 bytes. A long change is sent in as many `MODE` lines as it takes.
 - Users: `MODE` (`+i`: an invisible user is left out of `NAMES` and `WHO` of a channel for those outside it)
 - Messages: `PRIVMSG`, `NOTICE`, `TAGMSG`, `AWAY`, and multiline messages
 - Queries: `WHO`, `WHOIS`, `ISON`, `USERHOST`, `MOTD`, `LUSERS`
-- IRCv3: capability negotiation 3.2, `cap-notify`, `server-time`, `echo-message`, `multi-prefix`, `userhost-in-names`, `extended-join`, `away-notify`, `message-tags`, `message-ids`, `batch`, `labeled-response`, `standard-replies`, `draft/multiline`, `UTF8ONLY`, and the WebSocket transport (Cloudflare Workers only)
+- IRCv3: capability negotiation 3.2, `cap-notify`, `server-time`, `echo-message`, `multi-prefix`, `userhost-in-names`, `extended-join`, `away-notify`, `invite-notify`, `no-implicit-names`, `message-tags`, `message-ids`, `batch`, `labeled-response`, `standard-replies`, `draft/multiline`, `UTF8ONLY`, and the WebSocket transport (Cloudflare Workers only)
   - `message-tags`: the client-only tags of `PRIVMSG`, `NOTICE`, and `TAGMSG` are relayed to the clients that have the capability, whether the sender has it or not, and `TAGMSG` is delivered only to them. The other tags of a client are never relayed. `CLIENTTAGDENY=` says that every client-only tag is allowed. `TAGMSG` is answered like `PRIVMSG`, without `RPL_AWAY`.
   - `msgid`: every `PRIVMSG`, `NOTICE`, `TAGMSG`, and multiline message has one, the same for all its recipients and the echo, and one for each target. It is like a ULID: the time in milliseconds and 80 random bits, so the IDs sort by time and do not repeat after a restart.
   - `labeled-response` is used only when the client also has `batch`, which it depends on. A label longer than 64 bytes is ignored. A message to oneself with `echo-message` comes twice, the delivered one without the label and the echo with it.
   - `draft/multiline` (`max-bytes=4096,max-lines=100` by default): a batch is checked as it comes and delivered when it ends, with the checks of `PRIVMSG` done once for the whole message. A client that does not have the capability, or `batch`, gets the lines one by one, without the blank ones, and with the message ID and the client-only tags on the first one. A batch that breaks a rule gets a `FAIL` and the rest of it is ignored, and so are the lines of a batch that is not open. One batch can be open at a time; it is dropped after `timeout` (30 seconds, checked by `tick()`) and on a disconnection. The other commands are handled as usual while a batch is open. The sender needs `draft/multiline` and `batch`.
   - `UTF8ONLY`: a line that is not UTF-8 gets `FAIL <command> INVALID_UTF8` and is not handled, and the client stays. A `QUIT` is handled without its reason.
-- `CASEMAPPING=ascii`. The lengths of `NICKLEN`, `CHANNELLEN`, `TOPICLEN`, `AWAYLEN`, and `KICKLEN` are in bytes.
+  - `invite-notify`: the members of the channel that have it get the `INVITE` too.
+- `CASEMAPPING=ascii`. The lengths of `NICKLEN`, `CHANNELLEN`, `TOPICLEN`, `AWAYLEN`, `KICKLEN`, and `KEYLEN` are in bytes.
 - Lines: a client can send 4096 bytes of tags and 512 bytes of the rest. A longer line gets `ERR_INPUTTOOLONG` and is dropped. A line from the server is at most 512 bytes without the tags: a longer last parameter is cut. The tags that the server adds come first and are far below their 4094 bytes, and the relayed client-only tags are at most 4094 bytes, so a line has at most 8191 bytes of tags.
 - Targets: `PRIVMSG`, `NOTICE`, `TAGMSG`, and `KICK` take up to four, and `NAMES`, `WHO`, and `WHOIS` one, as `TARGMAX` shows. A repeated target counts once.
 - The address of the client is passed to the server, from `CF-Connecting-IP` for a WebSocket and from the Worker for TCP (see below). It is not shown to the other users, who see a cloak (see below).
@@ -108,9 +116,10 @@ The dependency is pinned to a commit, and pnpm builds it on install. To update i
 ## What is not implemented
 
 - TLS over TCP. According to the Cloudflare documentation, Spectrum terminates TLS for a Worker only with the Enterprise add-on, and `startTls()` is not supported for an inbound socket. A WebSocket has TLS (`wss://`) once deployed, which has not been tried.
-- Accounts (`SASL`), bans, invites, keys, operators, and server-to-server links.
+- Accounts (`SASL`), operators, and server-to-server links. So there are no extended bans, such as by account.
 - The WebSocket transport on Node.js, which has no WebSocket server built in. `src/websocket.ts` does not depend on a runtime.
 - The other IRCv3 extensions, such as `chathistory`, `account-tag`, and `STATUSMSG`. No standard reply is sent beyond what a spec defines, so `standard-replies` changes nothing yet.
+- `ELIST`, and the parameters of `LIST`. `WHO` with a mask that is not a channel or a nickname. `KNOCK`.
 
 ## The address of the client
 

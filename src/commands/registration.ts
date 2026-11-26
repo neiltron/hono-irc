@@ -1,6 +1,7 @@
 import { Hono } from 'tcp-hono'
 import {
   ERR_ALREADYREGISTERED,
+  ERR_BANNICKCHANGE,
   ERR_ERRONEUSNICKNAME,
   ERR_INVALIDCAPCMD,
   ERR_NEEDMOREPARAMS,
@@ -121,6 +122,19 @@ export const registration = (server: Server) => {
     }
     if (nick === client.nick) {
       return c.render()
+    }
+    // A member that is banned can not change its nickname to get around the ban, unless it is an
+    // operator or has voice, as on most servers.
+    const banned = [...client.channels].find(
+      (channel) => channel.banned(client) && !channel.privileged(client)
+    )
+    if (banned) {
+      return c.render([
+        ERR_BANNICKCHANGE,
+        nick,
+        banned.name,
+        'Cannot change nickname while banned on channel',
+      ])
     }
     if (client.registered) {
       for (const target of [client, ...server.peers(client)]) {

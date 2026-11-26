@@ -340,13 +340,15 @@ describe('Registries', () => {
     }
     const client = await register('alice')
     const lines = client.lines.filter((line) => / 005 /.test(line))
-    expect(lines).toHaveLength(2)
     const tokens = lines.map((line) => line.split(' ').slice(3, -5))
-    expect(tokens.map((list) => list.length)).toEqual([13, 9])
-    expect(lines[0]).toMatch(
-      / 005 alice CASEMAPPING=ascii .* FAKE0=0 :are supported by this server$/
+    expect(tokens.flat()).toHaveLength(server.isupport.size)
+    expect(tokens.slice(0, -1).map((list) => list.length)).toEqual(Array(lines.length - 1).fill(13))
+    expect(tokens.at(-1)!.length).toBeLessThanOrEqual(13)
+    expect(lines[0]).toMatch(/ 005 alice CASEMAPPING=ascii /)
+    expect(lines.at(-1)).toMatch(/ FAKE9 :are supported by this server$/)
+    expect(tokens.flat().slice(-10)).toEqual(
+      Array.from({ length: 10 }, (_, i) => (i % 2 ? `FAKE${i}` : `FAKE${i}=${i}`))
     )
-    expect(lines[1]).toMatch(/ 005 alice FAKE1 FAKE2=2 .* FAKE9 :are supported by this server$/)
   })
 })
 

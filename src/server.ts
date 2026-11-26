@@ -286,6 +286,8 @@ export const createServer = (config: ServerOptions = {}) => {
       server.clients.delete(connection)
       // A batch that the client has not closed is dropped.
       client.inbound = undefined
+      // Its invites.
+      server.forget(client)
       if (client.ip !== undefined) {
         const count = (server.addresses.get(client.ip) ?? 1) - 1
         if (count) {

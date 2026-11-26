@@ -73,9 +73,10 @@ export const queries = (server: Server) => {
       if (!target) {
         return [[ERR_NOSUCHNICK, echo(nick), 'No such nick/channel']]
       }
-      const joined = [...target.channels].map(
-        (channel) => channel.prefix(target, all) + channel.name
-      )
+      // A secret channel is shown only to its members.
+      const joined = [...target.channels]
+        .filter((channel) => channel.visibleTo(client))
+        .map((channel) => channel.prefix(target, all) + channel.name)
       return [
         [RPL_WHOISUSER, target.nick, target.user, target.host, '*', target.realname],
         ...server

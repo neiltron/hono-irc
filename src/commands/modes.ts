@@ -1,6 +1,9 @@
 import { Hono } from 'tcp-hono'
+import { compile, normalize } from '../masks.ts'
 import {
+  ERR_BANLISTFULL,
   ERR_CHANOPRIVSNEEDED,
+  ERR_INVALIDMODEPARAM,
   ERR_NEEDMOREPARAMS,
   ERR_NOSUCHCHANNEL,
   ERR_NOSUCHNICK,
@@ -8,17 +11,116 @@ import {
   ERR_UNKNOWNMODE,
   ERR_USERNOTINCHANNEL,
   ERR_USERSDONTMATCH,
+  RPL_BANLIST,
   RPL_CHANNELMODEIS,
   RPL_CREATIONTIME,
   RPL_ENDOFBANLIST,
+  RPL_ENDOFEXCEPTLIST,
+  RPL_ENDOFINVEXLIST,
+  RPL_EXCEPTLIST,
+  RPL_INVEXLIST,
   RPL_UMODEIS,
 } from '../numerics.ts'
-import { echo, msg } from '../state.ts'
-import type { Env, Line, Server } from '../state.ts'
+import { MAX_LINE_LENGTH, byteLength } from '../protocol.ts'
+import { KEY_LENGTH, MASK_LENGTH, MAX_LIST, MAX_MODES, echo, msg } from '../state.ts'
+import type { Channel, Client, Env, Line, ListMode, Server } from '../state.ts'
+
+type Change = { adding: boolean; mode: string; arg?: string }
+
+// The channel modes by their type in CHANMODES, and the ranks of PREFIX.
+const LISTS = 'beI'
+const RANKS = 'ov'
+const SETTINGS = 'imnst'
+
+/** The replies that show a list: an entry and the end. */
+const LIST_REPLIES: Record<ListMode, [entry: string, end: string, text: string]> = {
+  b: [RPL_BANLIST, RPL_ENDOFBANLIST, 'End of channel ban list'],
+  e: [RPL_EXCEPTLIST, RPL_ENDOFEXCEPTLIST, 'End of channel exception list'],
+  I: [RPL_INVEXLIST, RPL_ENDOFINVEXLIST, 'End of Channel Invite Exception List'],
+}
+
+// A key goes in JOIN as one item of a list, so it can not have a comma, and a key or a mask is a
+// parameter in the middle of a line, so it can not have a space or start with a colon.
+const KEY_PATTERN = /^[^\s,:\p{Cc}][^\s,\p{Cc}]*$/u
+const MASK_PATTERN = /^[^\s:\p{Cc}][^\s\p{Cc}]*$/u
+
+/** The modestring of the changes, e.g. `+ov-k`, and their parameters. */
+const modestring = (changes: Change[]) => {
+  let sign: boolean | undefined
+  let modes = ''
+  for (const change of changes) {
+    if (change.adding !== sign) {
+      sign = change.adding
+      modes += sign ? '+' : '-'
+    }
+    modes += change.mode
+  }
+  return [modes, ...changes.flatMap((change) => change.arg ?? [])]
+}
 
 /** Modes: `MODE` for a user and for a channel. */
 export const modes = (server: Server) => {
   const app = new Hono<Env>()
+
+  /**
+   * The MODE messages of the changes. They are split so that each line fits, as a line with a
+   * few long masks can be longer than 512 bytes.
+   */
+  const announce = (client: Client, channel: Channel, changes: Change[]) => {
+    const fits = (part: Change[]) =>
+      byteLength(`:${client.mask} MODE ${channel.name} ${modestring(part).join(' ')}`) <=
+      MAX_LINE_LENGTH - 2
+    let part: Change[] = []
+    for (const change of changes) {
+      if (part.length && !fits([...part, change])) {
+        channel.send(msg(client.mask, 'MODE', channel.name, ...modestring(part)))
+        part = []
+      }
+      part.push(change)
+    }
+    if (part.length) {
+      channel.send(msg(client.mask, 'MODE', channel.name, ...modestring(part)))
+    }
+  }
+
+  /** RPL_CHANNELMODEIS. The values of the key and the limit are only for the members. */
+  const channelModes = (client: Client, channel: Channel): Line => {
+    const letters = [...channel.modes]
+    const values: string[] = []
+    if (channel.key !== undefined) {
+      letters.push('k')
+    }
+    if (channel.limit !== undefined) {
+      letters.push('l')
+    }
+    letters.sort()
+    if (channel.members.has(client)) {
+      for (const letter of letters) {
+        if (letter === 'k') {
+          values.push(channel.key!)
+        } else if (letter === 'l') {
+          values.push(String(channel.limit))
+        }
+      }
+    }
+    return [RPL_CHANNELMODEIS, channel.name, '+' + letters.join(''), ...values]
+  }
+
+  /**
+   * The entries of a list. The bans are shown to anyone who can see the channel, and the
+   * exceptions only to the operators, as on most servers.
+   */
+  const showList = (client: Client, channel: Channel, mode: ListMode): Line[] => {
+    const [entry, end, text] = LIST_REPLIES[mode]
+    if (mode !== 'b' && !channel.members.get(client)?.has('o')) {
+      return [[ERR_CHANOPRIVSNEEDED, channel.name, "You're not channel operator"]]
+    }
+    const entries = channel.visibleTo(client) ? channel.lists[mode] : []
+    return [
+      ...entries.map((item): Line => [entry, channel.name, item.mask, item.by, item.at]),
+      [end, channel.name, text],
+    ]
+  }
 
   app.on('TCP', '/MODE/*', (c) => {
     const { client, message } = c.var
@@ -62,65 +164,127 @@ export const modes = (server: Server) => {
     }
 
     if (!modes) {
-      return c.render(
-        [RPL_CHANNELMODEIS, channel.name, '+' + [...channel.modes].sort().join('')],
-        [RPL_CREATIONTIME, channel.name, channel.created]
-      )
+      return c.render(channelModes(client, channel), [
+        RPL_CREATIONTIME,
+        channel.name,
+        channel.created,
+      ])
     }
 
+    // The modes are applied in order. A mode of type A (a list) takes a parameter to change the
+    // list, and shows the list without one, which anyone may ask for. Type B (k) takes one both
+    // ways, type C (l) only to set it, and type D none. A mode that needs a parameter that is
+    // missing is ignored, and so are the ones over MODES.
     const lines: Line[] = []
-    const changes: { adding: boolean; mode: string; arg?: string }[] = []
+    const changes: Change[] = []
+    const shown = new Set<string>()
     const operator = channel.members.get(client)?.has('o')
     let adding = true
+    let parameters = 0
     for (const mode of modes) {
       if (mode === '+' || mode === '-') {
         adding = mode === '+'
-      } else if (mode === 'b' && !args.length) {
-        // Clients ask for the ban list on joining. Bans are not implemented, so it is empty.
-        lines.push([RPL_ENDOFBANLIST, channel.name, 'End of channel ban list'])
-      } else if (!operator) {
+        continue
+      }
+      const takes =
+        LISTS.includes(mode) || RANKS.includes(mode) || mode === 'k' || (mode === 'l' && adding)
+      if (LISTS.includes(mode) && !args.length) {
+        if (!shown.has(mode)) {
+          shown.add(mode)
+          lines.push(...showList(client, channel, mode as ListMode))
+        }
+        continue
+      }
+      if (!takes && mode !== 'l' && !SETTINGS.includes(mode)) {
+        lines.push([ERR_UNKNOWNMODE, echo(mode), 'is unknown mode char to me'])
+        continue
+      }
+      if (!operator) {
         lines.push([ERR_CHANOPRIVSNEEDED, channel.name, "You're not channel operator"])
         break
-      } else if (mode === 'o' || mode === 'v') {
-        const nick = args.shift()
-        const target = nick ? server.nicks.get(server.fold(nick)) : undefined
-        const ranks = target && channel.members.get(target)
-        if (!nick) {
+      }
+      let arg: string | undefined
+      if (takes) {
+        if (parameters >= MAX_MODES) {
           continue
         }
+        arg = args.shift()
+        // `-k` without a key is taken as it is.
+        if (arg === undefined && (mode !== 'k' || adding)) {
+          continue
+        }
+        parameters += arg === undefined ? 0 : 1
+      }
+
+      if (RANKS.includes(mode)) {
+        const target = server.nicks.get(server.fold(arg!))
+        const ranks = target && channel.members.get(target)
         if (!target || !ranks) {
           lines.push([
             ERR_USERNOTINCHANNEL,
-            echo(nick),
+            echo(arg!),
             channel.name,
             "They aren't on that channel",
           ])
-        } else if (ranks.has(mode) !== adding) {
-          ranks[adding ? 'add' : 'delete'](mode)
+        } else if (ranks.has(mode as 'o' | 'v') !== adding) {
+          ranks[adding ? 'add' : 'delete'](mode as 'o' | 'v')
           changes.push({ adding, mode, arg: target.nick })
         }
-      } else if ('mnt'.includes(mode)) {
-        if (channel.modes.has(mode) !== adding) {
-          channel.modes[adding ? 'add' : 'delete'](mode)
-          changes.push({ adding, mode })
+      } else if (LISTS.includes(mode)) {
+        const list = channel.lists[mode as ListMode]
+        const mask = normalize(arg!)
+        const folded = server.fold(mask)
+        const index = list.findIndex((entry) => server.fold(entry.mask) === folded)
+        if (!MASK_PATTERN.test(arg!) || byteLength(mask) > MASK_LENGTH) {
+          lines.push([ERR_INVALIDMODEPARAM, channel.name, mode, echo(arg!), 'Invalid mask'])
+        } else if (!adding) {
+          if (index !== -1) {
+            const [removed] = list.splice(index, 1)
+            changes.push({ adding, mode, arg: removed.mask })
+          }
+        } else if (index === -1) {
+          const { b, e, I } = channel.lists
+          if (b.length + e.length + I.length >= MAX_LIST) {
+            lines.push([ERR_BANLISTFULL, channel.name, mask, 'Channel list is full'])
+          } else {
+            const at = Math.floor(Date.now() / 1000)
+            list.push({ mask, by: client.mask, at, glob: compile(folded) })
+            changes.push({ adding, mode, arg: mask })
+          }
         }
-      } else {
-        lines.push([ERR_UNKNOWNMODE, echo(mode), 'is unknown mode char to me'])
+      } else if (mode === 'k') {
+        if (!adding) {
+          if (channel.key !== undefined) {
+            channel.key = undefined
+            // A mode of type B has a parameter both ways, and the key is not repeated.
+            changes.push({ adding, mode, arg: '*' })
+          }
+        } else if (!KEY_PATTERN.test(arg!) || byteLength(arg!) > KEY_LENGTH) {
+          lines.push([ERR_INVALIDMODEPARAM, channel.name, mode, echo(arg!), 'Invalid key'])
+        } else if (channel.key !== arg) {
+          channel.key = arg
+          changes.push({ adding, mode, arg })
+        }
+      } else if (mode === 'l') {
+        if (!adding) {
+          if (channel.limit !== undefined) {
+            channel.limit = undefined
+            changes.push({ adding, mode })
+          }
+        } else if (!/^\d{1,9}$/.test(arg!) || !Number(arg)) {
+          lines.push([ERR_INVALIDMODEPARAM, channel.name, mode, echo(arg!), 'Invalid limit'])
+        } else if (channel.limit !== Number(arg)) {
+          channel.limit = Number(arg)
+          changes.push({ adding, mode, arg: String(channel.limit) })
+        }
+      } else if (channel.modes.has(mode) !== adding) {
+        channel.modes[adding ? 'add' : 'delete'](mode)
+        changes.push({ adding, mode })
       }
     }
 
     if (changes.length) {
-      let sign: boolean | undefined
-      let modestring = ''
-      for (const change of changes) {
-        if (change.adding !== sign) {
-          sign = change.adding
-          modestring += sign ? '+' : '-'
-        }
-        modestring += change.mode
-      }
-      const modeArgs = changes.flatMap((change) => change.arg ?? [])
-      channel.send(msg(client.mask, 'MODE', channel.name, modestring, ...modeArgs))
+      announce(client, channel, changes)
     }
     return c.render(...lines)
   })
