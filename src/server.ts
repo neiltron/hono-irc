@@ -8,12 +8,90 @@ import { queries } from './commands/queries.ts'
 import { registration } from './commands/registration.ts'
 import { flood } from './flood.ts'
 import { ERR_INPUTTOOLONG, ERR_NOTREGISTERED, ERR_UNKNOWNCOMMAND } from './numerics.ts'
-import { INPUT_TOO_LONG, format, irc, parse } from './protocol.ts'
+import { INPUT_TOO_LONG, byteLength, format, irc, parse, parseTags } from './protocol.ts'
 import type { IRCMessage } from './protocol.ts'
 import { Client, Server, msg } from './state.ts'
-import type { ConnectionInfo, Env, Line, ServerOptions } from './state.ts'
+import type { ConnectionInfo, Env, Line, OutboxEntry, ServerOptions } from './state.ts'
 
 export type { ConnectionInfo, ServerOptions }
+
+const TOO_LONG_PATH = '/' + encodeURIComponent(INPUT_TOO_LONG)
+
+/** The max length of a label in bytes, as labeled-response says. */
+const MAX_LABEL_LENGTH = 64
+
+const isBatch = (message: IRCMessage, sign: '+' | '-', ref?: string) =>
+  message.command === 'BATCH' &&
+  message.tags?.batch === undefined &&
+  (ref === undefined ? message.params[0]?.[0] === sign : message.params[0] === sign + ref)
+
+/**
+ * Make the response to a labeled command, as labeled-response says: the label goes on the only
+ * logical message of the response, which is one line or one batch; an
+ * `ACK` is the response when there is none; and several are put in a `labeled-response` batch.
+ *
+ * The entries that are not part of the response stay where they are, without the label and
+ * outside the batch, which a batch allows. The messages are copied, as the others may share them.
+ */
+const labelResponse = (server: Server, client: Client, label: string, entries: OutboxEntry[]) => {
+  // The indexes of the first and the last line of each logical message of the response.
+  const logical: [first: number, last: number][] = []
+  let open: string | undefined
+  entries.forEach(({ message, response }, i) => {
+    if (!response) {
+      return
+    }
+    if (open !== undefined) {
+      logical[logical.length - 1][1] = i
+      open = isBatch(message, '-', open) ? undefined : open
+      return
+    }
+    logical.push([i, i])
+    open = isBatch(message, '+') ? message.params[0].slice(1) : undefined
+  })
+  const tag = (entry: OutboxEntry, tags: Record<string, string>): OutboxEntry => ({
+    ...entry,
+    message: { ...entry.message, tags: { ...entry.message.tags, ...tags } },
+  })
+
+  if (!logical.length) {
+    return [
+      ...entries,
+      {
+        message: { tags: { label }, source: server.name, command: 'ACK', params: [] },
+        response: true,
+      },
+    ]
+  }
+  if (logical.length === 1) {
+    return entries.map((entry, i) => (i === logical[0][0] ? tag(entry, { label }) : entry))
+  }
+  const ref = client.reference()
+  const first = logical[0][0]
+  const last = logical[logical.length - 1][1]
+  const start = {
+    tags: { label },
+    source: server.name,
+    command: 'BATCH',
+    params: ['+' + ref, 'labeled-response'],
+  }
+  const end = { source: server.name, command: 'BATCH', params: ['-' + ref] }
+  return [
+    ...entries.slice(0, first),
+    { message: start, response: true },
+    // A line of a batch in the response is in that batch, which is nested: its start and end lines
+    // are the ones in the labeled-response batch.
+    ...entries
+      .slice(first, last + 1)
+      .map((entry) =>
+        entry.response && entry.message.tags?.batch === undefined
+          ? tag(entry, { batch: ref })
+          : entry
+      ),
+    { message: end, response: true },
+    ...entries.slice(last + 1),
+  ]
+}
 
 /**
  * An IRC server. The state is in memory and it does not depend on a runtime.
@@ -31,8 +109,21 @@ export const createServer = (config: ServerOptions = {}) => {
       // A connection that was refused in `onOpen()`. Its read loop ends without a message.
       return c.body(null)
     }
-    // A line that was too long comes without a body, and the rest are lines that parse.
-    const message = parse(await c.req.text()) ?? { command: INPUT_TOO_LONG, params: [] }
+    // A line that was too long comes with its tags at most, and the rest are lines that parse.
+    const text = await c.req.text()
+    const tooLong = c.req.path === TOO_LONG_PATH
+    const message: IRCMessage = (tooLong
+      ? { ...(text && { tags: parseTags(text.slice(1)) }), command: INPUT_TOO_LONG, params: [] }
+      : parse(text)) ?? { command: INPUT_TOO_LONG, params: [] }
+    // A client that has labeled-response and batch gets its label back. A label must not be longer
+    // than 64 bytes. A longer one is ignored, and the command is answered as without one.
+    const label =
+      message.tags?.label &&
+      byteLength(message.tags.label) <= MAX_LABEL_LENGTH &&
+      client.capabilities.has('labeled-response') &&
+      client.capabilities.has('batch')
+        ? message.tags.label
+        : undefined
     client.active = Date.now()
     client.pinged = false
     c.set('client', client)
@@ -59,7 +150,11 @@ export const createServer = (config: ServerOptions = {}) => {
     // `onError()`, and nothing that another connection does in the meantime. If a handler ever
     // awaits, the outbox is closed from that point: what it sends after the await is pushed
     // before the response, out of order, and outside anything that wraps the response.
-    const outbox: IRCMessage[] = []
+    //
+    // This is why the label of labeled-response is added here, to the outbox only: it is exactly
+    // what the command caused. The flood control waits before the outbox is opened, so what the
+    // others send to the client during the wait is pushed as usual, without the label.
+    const outbox: OutboxEntry[] = []
     client.outbox = outbox
     let handled: Promise<void> | undefined
     try {
@@ -73,10 +168,22 @@ export const createServer = (config: ServerOptions = {}) => {
     }
     await handled
 
-    if (outbox.length) {
+    if (label !== undefined) {
+      // A body that a handler writes itself, such as the ERROR of QUIT, is part of the response.
+      const body = c.finalized ? await c.res.text() : ''
+      const written = body
+        .split(/\r?\n/)
+        .map((line) => parse(line))
+        .filter((message) => message !== undefined)
+        .map((message) => ({ message, response: true }))
+      const lines = labelResponse(server, client, label, [...outbox, ...written])
+      c.res = new Response(lines.map(({ message }) => client.format(message)).join('\r\n'), {
+        headers: c.res.headers,
+      })
+    } else if (outbox.length) {
       // A body that a handler writes itself, such as the ERROR of QUIT, follows the outbox.
       const body = c.finalized ? await c.res.text() : ''
-      const lines = outbox.map((message) => client.format(message))
+      const lines = outbox.map(({ message }) => client.format(message))
       // The headers are kept for `Connection: close`.
       c.res = new Response([...lines, ...(body ? [body] : [])].join('\r\n'), {
         headers: c.res.headers,
@@ -92,9 +199,7 @@ export const createServer = (config: ServerOptions = {}) => {
 
   // The decoder yields this in place of a line that is too long. The line is dropped and the
   // connection stays open.
-  app.on('TCP', '/' + encodeURIComponent(INPUT_TOO_LONG), (c) =>
-    c.render([ERR_INPUTTOOLONG, 'Input line was too long'])
-  )
+  app.on('TCP', TOO_LONG_PATH, (c) => c.render([ERR_INPUTTOOLONG, 'Input line was too long']))
   server.beforeRegistration.add(INPUT_TOO_LONG)
 
   // Every command is routed as `/COMMAND/*` and checks its own parameters, so a command that is

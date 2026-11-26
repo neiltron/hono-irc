@@ -19,7 +19,31 @@ const unescapes: Record<string, string> = { ':': ';', s: ' ', r: '\r', n: '\n' }
 const escapes: Record<string, string> = { ';': '\\:', ' ': '\\s', '\r': '\\r', '\n': '\\n' }
 
 const unescapeTag = (value: string) => value.replace(/\\(.?)/g, (_, c: string) => unescapes[c] ?? c)
-const escapeTag = (value: string) => value.replace(/[; \r\n\\]/g, (c) => escapes[c] ?? '\\\\')
+// NUL has no escape and is not allowed in a value, so it is dropped.
+const escapeTag = (value: string) =>
+  value.replace(/[; \r\n\\\0]/g, (c) => (c === '\0' ? '' : (escapes[c] ?? '\\\\')))
+
+/** The tags of a message, from the tag part of a line without the leading `@`. */
+export const parseTags = (data: string): Record<string, string> => {
+  const tags: Record<string, string> = {}
+  for (const tag of data.split(';')) {
+    const i = tag.indexOf('=')
+    const key = i === -1 ? tag : tag.slice(0, i)
+    if (key) {
+      tags[key] = i === -1 ? '' : unescapeTag(tag.slice(i + 1))
+    }
+  }
+  return tags
+}
+
+// The tag data of a line, between `@` and the space. A tag with an empty value is sent without
+// one, as the spec allows: `a` for `a=`.
+const formatTags = (tags: [string, string][]) =>
+  tags.map(([k, v]) => (v === '' ? k : `${k}=${escapeTag(v)}`)).join(';')
+
+/** The length in bytes of the tag data that the tags take on a line, without `@` and the space. */
+export const tagsLength = (tags: Record<string, string>): number =>
+  byteLength(formatTags(Object.entries(tags)))
 
 /**
  * Parse a line without the line terminator. Returns `undefined` if the line has no command.
@@ -34,17 +58,7 @@ export const parse = (line: string): IRCMessage | undefined => {
     return value
   }
 
-  let tags: Record<string, string> | undefined
-  if (rest[0] === '@') {
-    tags = {}
-    for (const tag of word().slice(1).split(';')) {
-      const i = tag.indexOf('=')
-      const key = i === -1 ? tag : tag.slice(0, i)
-      if (key) {
-        tags[key] = i === -1 ? '' : unescapeTag(tag.slice(i + 1))
-      }
-    }
-  }
+  const tags = rest[0] === '@' ? parseTags(word().slice(1)) : undefined
   const source = rest[0] === ':' ? word().slice(1) : undefined
   const command = word().toUpperCase()
   if (!command) {
@@ -65,6 +79,12 @@ export const parse = (line: string): IRCMessage | undefined => {
 export const MAX_LINE_LENGTH = 512
 /** The max length of the tags of a line from a client, in bytes, with `@` and the space after. */
 export const MAX_TAGS_LENGTH = 4096
+/**
+ * The max length of the tag data that a client may send, and that the server may add to a line,
+ * without `@` and the space: 4094 bytes each, so a line from the server has at most 8191 bytes of
+ * tags, as message-tags says.
+ */
+export const MAX_TAG_DATA = MAX_TAGS_LENGTH - 2
 /** The max length of a line that is skipped as too long, before the connection is closed. */
 export const MAX_SKIP_LENGTH = 65536
 
@@ -143,9 +163,7 @@ const formatBody = (message: IRCMessage): string => {
  */
 export const format = (message: IRCMessage, max?: number): string => {
   const tags = Object.entries(message.tags ?? {})
-  const head = tags.length
-    ? '@' + tags.map(([k, v]) => (v === '' ? k : `${k}=${escapeTag(v)}`)).join(';') + ' '
-    : ''
+  const head = tags.length ? '@' + formatTags(tags) + ' ' : ''
   let body = formatBody(message)
   if (max !== undefined && byteLength(body) > max && message.params.length) {
     const params = [...message.params]
@@ -162,7 +180,8 @@ export const format = (message: IRCMessage, max?: number): string => {
 
 /**
  * The command of the message that the decoder yields in place of a line that is too long.
- * It has spaces, so it is never the command of a line from a client. The message has no body.
+ * It has spaces, so it is never the command of a line from a client. The body of the message is
+ * the tag part of the line, if any could be kept (see `irc()`).
  */
 export const INPUT_TOO_LONG = 'INPUT TOO LONG'
 
@@ -186,11 +205,15 @@ export type IRCOptions = {
   maxSkipLength?: number
 }
 
-const TOO_LONG = Symbol('too long')
+/**
+ * A line that was too long. `tags` is its tag part with `@` and without the space, if the tags
+ * were whole and within their limit, so that the reply can carry the `label` of the line.
+ */
+type TooLong = { tags?: Uint8Array }
 
 /**
  * Create a function that cuts out lines from chunks. Both CRLF and LF are accepted.
- * A line that is too long is yielded as `TOO_LONG`, once, and its bytes are dropped.
+ * A line that is too long is yielded as a `TooLong`, once, and its bytes are dropped.
  */
 const splitLines = (options: IRCOptions) => {
   const maxLength = options.maxLength ?? MAX_LINE_LENGTH
@@ -210,7 +233,13 @@ const splitLines = (options: IRCOptions) => {
     return tags > maxTagsLength || line.length + 1 - tags > maxLength
   }
 
-  return function* (chunk?: Uint8Array): Generator<Uint8Array | typeof TOO_LONG> {
+  // The start of a line is enough to find its tags. A copy, so the chunk is not held.
+  const tagsOf = (start: Uint8Array): TooLong => {
+    const space = start[0] === 0x40 ? start.indexOf(0x20) : -1
+    return space !== -1 && space + 1 <= maxTagsLength ? { tags: start.slice(0, space) } : {}
+  }
+
+  return function* (chunk?: Uint8Array): Generator<Uint8Array | TooLong> {
     if (!chunk) {
       // The end of the stream. A line without a line terminator is not a message.
       return
@@ -236,7 +265,7 @@ const splitLines = (options: IRCOptions) => {
         buffered = 0
       }
       yield tooLong(line)
-        ? TOO_LONG
+        ? tagsOf(line)
         : line.subarray(0, line[line.length - 1] === 0x0d ? -1 : line.length)
     }
 
@@ -245,10 +274,17 @@ const splitLines = (options: IRCOptions) => {
       skipped += rest.length
     } else if (buffered + rest.length > limit) {
       // The line can not be valid any more. It is reported at once, and the rest of it is dropped.
+      // The tags, if they are within their limit, are in the first bytes.
+      const start = new Uint8Array(Math.min(buffered + rest.length, maxTagsLength + 1))
+      let offset = 0
+      for (const part of [...parts, rest]) {
+        start.set(part.subarray(0, start.length - offset), offset)
+        offset = Math.min(offset + part.length, start.length)
+      }
       skipped = buffered + rest.length
       parts = []
       buffered = 0
-      yield TOO_LONG
+      yield tagsOf(start)
     } else if (rest.length) {
       parts.push(rest)
       buffered += rest.length
@@ -266,8 +302,9 @@ const splitLines = (options: IRCOptions) => {
  * as `/PRIVMSG/#hono/Hello World`. The whole line is available as the body. Use `parse()` to get
  * the tags, the source, and the parameters that a path can not express, such as an empty one.
  *
- * A line that is too long is not a message. It is routed as `INPUT_TOO_LONG`, without a body,
- * so the app can reply to it and keep the connection open.
+ * A line that is too long is not a message. It is routed as `INPUT_TOO_LONG`, so the app can
+ * reply to it and keep the connection open. Its body is the tag part of the line (`@a=b;c`), if the
+ * tags were whole and within their limit, and empty otherwise.
  *
  * IRC is not a request/response protocol, so most of the output is written with `send()` of
  * the connection. A response without a body, e.g. `c.body(null)`, writes nothing.
@@ -277,8 +314,8 @@ export const irc = (options: IRCOptions = {}): Protocol => ({
     const split = splitLines(options)
     return function* (chunk): Generator<Message> {
       for (const body of split(chunk)) {
-        if (body === TOO_LONG) {
-          yield { args: [INPUT_TOO_LONG] }
+        if (!(body instanceof Uint8Array)) {
+          yield { args: [INPUT_TOO_LONG], ...(body.tags && { body: body.tags }) }
           continue
         }
         const message = parse(decoder.decode(body))

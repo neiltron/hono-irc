@@ -20,7 +20,7 @@ import {
   ERR_NOMOTD,
   ERR_TOOMANYTARGETS,
 } from './numerics.ts'
-import { MAX_LINE_LENGTH, byteLength, format } from './protocol.ts'
+import { MAX_LINE_LENGTH, MAX_TAG_DATA, byteLength, format, tagsLength } from './protocol.ts'
 import type { IRCMessage } from './protocol.ts'
 
 /** A reply from the server. The nickname of the client is inserted into a numeric reply. */
@@ -81,6 +81,7 @@ export type ConnectionInfo = {
 }
 
 export const VERSION = 'hono-irc-0.0.1'
+const CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
 // The lengths are in bytes of UTF-8.
 export const NICK_LENGTH = 30
 export const CHANNEL_LENGTH = 50
@@ -90,7 +91,15 @@ export const KICK_LENGTH = 300
 /** The max number of channels that a client can join. */
 export const MAX_CHANNELS = 50
 /** The max number of targets of a command, as `TARGMAX` shows it. */
-export const MAX_TARGETS = { PRIVMSG: 4, NOTICE: 4, KICK: 4, NAMES: 1, WHO: 1, WHOIS: 1 }
+export const MAX_TARGETS = {
+  PRIVMSG: 4,
+  NOTICE: 4,
+  TAGMSG: 4,
+  KICK: 4,
+  NAMES: 1,
+  WHO: 1,
+  WHOIS: 1,
+}
 
 // No whitespace, commas, colons, control characters such as BEL, or format characters,
 // such as the bidirectional overrides and the zero-width ones, which can make two names look alike.
@@ -119,11 +128,54 @@ export const msg = (source: string, command: string, ...params: string[]): IRCMe
   params,
 })
 
-// The time is added once, so every recipient of a message gets the same one.
-const stamp = (message: IRCMessage): IRCMessage =>
+/** Add the `time` tag once, so every recipient of a message gets the same one. */
+export const stamp = (message: IRCMessage): IRCMessage =>
   message.tags?.time === undefined
     ? { ...message, tags: { time: new Date().toISOString(), ...message.tags } }
     : message
+
+/**
+ * A standard reply, `FAIL <command> <code> [<context>...] <description>`, to render with
+ * `c.render()` or to send. `command` is `*` for a reply that no command caused. A reply that no
+ * spec defines is sent only to a client with `standard-replies`.
+ */
+export const fail = (command: string, code: string, ...rest: [...string[], string]): Line => [
+  'FAIL',
+  command,
+  code,
+  ...rest,
+]
+export const warn = (command: string, code: string, ...rest: [...string[], string]): Line => [
+  'WARN',
+  command,
+  code,
+  ...rest,
+]
+export const note = (command: string, code: string, ...rest: [...string[], string]): Line => [
+  'NOTE',
+  command,
+  code,
+  ...rest,
+]
+
+/**
+ * The client-only tags (`+name`) of a message from a client, which are relayed with it. The other
+ * tags of a client are never relayed: `time`, `msgid`, `batch`, `label` and the like are set by the
+ * server, or read by it. `undefined` if they would take more than 4094 bytes on a line, which can
+ * happen only with a raw CR in a value, as it is escaped to two bytes: the line is then too long.
+ */
+export const clientTags = (tags?: Record<string, string>): Record<string, string> | undefined => {
+  const result: Record<string, string> = {}
+  for (const [key, value] of Object.entries(tags ?? {})) {
+    if (key[0] === '+' && key.length > 1) {
+      result[key] = value
+    }
+  }
+  return tagsLength(result) <= MAX_TAG_DATA ? result : undefined
+}
+
+/** A message to the client during its own command, and whether it is part of the response. */
+export type OutboxEntry = { message: IRCMessage; response: boolean }
 
 export class Client {
   nick = '*'
@@ -158,7 +210,9 @@ export class Client {
    * The messages to this client while its own command is handled. The middleware in `server.ts`
    * opens it and writes it as the response, so they are not pushed. `undefined` otherwise.
    */
-  outbox?: IRCMessage[]
+  outbox?: OutboxEntry[]
+  // The last reference tag of a batch to this client, which is unique for the connection.
+  #references = 0
 
   server: Server
   connection: Connection
@@ -177,31 +231,82 @@ export class Client {
   /**
    * Send a message to the client. It goes to the outbox during the client's own request,
    * and is pushed to the connection otherwise. The `time` tag is added here.
+   *
+   * `response` is false for a message to the client during its own command that the command did
+   * not answer, such as its own private message to itself, which is delivered like any other and
+   * must not carry the `label` of the command. The echo of echo-message is the response.
    */
-  send(message: IRCMessage) {
+  send(message: IRCMessage, response = true) {
     message = stamp(message)
     if (this.outbox) {
-      this.outbox.push(message)
+      this.outbox.push({ message, response })
     } else {
       this.connection.send(this.format(message) + '\r\n')
     }
   }
 
+  /** A new reference tag for a batch to this client. */
+  reference(): string {
+    return (++this.#references).toString(36)
+  }
+
+  /**
+   * Send messages as one batch: `BATCH +ref type params`, the messages with the `batch` tag, and
+   * `BATCH -ref`, with `tags`, such as `msgid`, on the `BATCH +` line. A client without `batch`
+   * gets the messages alone, with `tags` on the first one.
+   */
+  sendBatch(
+    batch: { source: string; type: string; params?: string[]; tags?: Record<string, string> },
+    messages: IRCMessage[],
+    response = true
+  ) {
+    if (!this.capabilities.has('batch')) {
+      messages.forEach((message, i) => {
+        this.send(i ? message : { ...message, tags: { ...batch.tags, ...message.tags } }, response)
+      })
+      return
+    }
+    const ref = this.reference()
+    const { source, type, params = [], tags } = batch
+    this.send({ tags, source, command: 'BATCH', params: ['+' + ref, type, ...params] }, response)
+    for (const message of messages) {
+      this.send({ ...message, tags: { batch: ref, ...message.tags } }, response)
+    }
+    const end = { source, command: 'BATCH', params: ['-' + ref] }
+    this.send(tags?.time ? { ...end, tags: { time: tags.time } } : end, response)
+  }
+
   /**
    * Format a message for this client. This is the only place where the tags are filtered:
-   * a tag is kept only if the client has negotiated the capability that owns it.
+   * a tag is kept only if the client has negotiated the capability that owns it, and a
+   * client-only tag (`+name`) only if it has `message-tags`.
+   *
+   * The tags that the server sets come first, and the client-only ones after them. The server sets
+   * a few short tags, far below the 4094 bytes of tag data that it may add, and the client-only
+   * tags are at most 4094 bytes as they came in (see `clientTags()`), so a line has at most 8191
+   * bytes of tags. If the client-only tags of a line took more anyway, they would be dropped
+   * together, as a tag must not be cut.
    *
    * This is also where the length of a line is enforced: without the tags and the line
    * terminator, it is at most 510 bytes. A longer last parameter is cut on a character boundary.
    */
   format(message: IRCMessage): string {
     const tags: Record<string, string> = {}
+    const relayed: Record<string, string> = {}
     for (const [key, value] of Object.entries(message.tags ?? {})) {
-      // A client-only tag (`+name`) will belong to `message-tags`, which needs a rule here.
+      if (key[0] === '+') {
+        if (this.capabilities.has('message-tags')) {
+          relayed[key] = value
+        }
+        continue
+      }
       const capability = this.server.tagCapabilities.get(key)
       if (capability && this.capabilities.has(capability)) {
         tags[key] = value
       }
+    }
+    if (tagsLength(relayed) <= MAX_TAG_DATA) {
+      Object.assign(tags, relayed)
     }
     return format({ ...message, tags }, MAX_LINE_LENGTH - 2)
   }
@@ -217,6 +322,15 @@ export class Channel {
 
   constructor(name: string) {
     this.name = name
+  }
+
+  /** Whether the client may send a message to the channel: PRIVMSG, NOTICE, or TAGMSG. */
+  canSend(client: Client) {
+    const ranks = this.members.get(client)
+    return !(
+      (this.modes.has('n') && !ranks) ||
+      (this.modes.has('m') && !ranks?.has('o') && !ranks?.has('v'))
+    )
   }
 
   /** Send a message to every member, including the sender. */
@@ -271,6 +385,10 @@ export class Server {
     ['multi-prefix', undefined],
     ['server-time', undefined],
     ['userhost-in-names', undefined],
+    ['message-tags', undefined],
+    ['batch', undefined],
+    ['labeled-response', undefined],
+    ['standard-replies', undefined],
   ])
 
   /**
@@ -279,10 +397,10 @@ export class Server {
    */
   tagCapabilities = new Map<string, string>([
     ['time', 'server-time'],
-    // ['msgid', 'message-tags'],
     // ['account', 'account-tag'],
-    // ['batch', 'batch'],
-    // ['label', 'labeled-response'],
+    ['msgid', 'message-tags'],
+    ['batch', 'batch'],
+    ['label', 'labeled-response'],
   ])
 
   /** The RPL_ISUPPORT tokens. `true` is a token without a value. */
@@ -325,7 +443,48 @@ export class Server {
           .map(([command, max]) => `${command}:${max}`)
           .join(','),
       ],
+      // Every client-only tag is allowed. The token is empty, which means the same as no token.
+      ['CLIENTTAGDENY', ''],
     ])
+  }
+
+  // The time and the random part of the last message ID, which are increased for the next one.
+  #msgTime = 0
+  #msgRandom = new Uint8Array(10)
+
+  /**
+   * A new message ID for the `msgid` tag. It is like a ULID: 48 bits of the time in milliseconds
+   * and 80 random bits, in 26 characters of Crockford's base32, so the IDs sort by time and do not
+   * repeat across restarts. Within the same millisecond, or if the clock goes back, the random
+   * part of the last one is increased by one, so they stay unique and in order in a process.
+   */
+  msgid(): string {
+    const now = Date.now()
+    const random = this.#msgRandom
+    if (now > this.#msgTime) {
+      this.#msgTime = now
+      crypto.getRandomValues(random)
+    } else {
+      for (let i = random.length - 1; i >= 0 && ++random[i] === 256; i--) {
+        random[i] = 0
+      }
+    }
+    let id = ''
+    for (let time = this.#msgTime, i = 0; i < 10; i++, time = Math.floor(time / 32)) {
+      id = CROCKFORD[time % 32] + id
+    }
+    // 80 bits are 16 characters of 5 bits.
+    let bits = 0
+    let value = 0
+    for (const byte of random) {
+      value = ((value & 31) << 8) | byte
+      bits += 8
+      while (bits >= 5) {
+        bits -= 5
+        id += CROCKFORD[(value >> bits) & 31]
+      }
+    }
+    return id
   }
 
   /** CASEMAPPING=ascii: only A to Z are folded, so a name with other letters stays as it is. */

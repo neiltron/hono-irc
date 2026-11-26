@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vite-plus/test'
 import { Hono, getConnection, tcp } from 'tcp-hono'
-import { INPUT_TOO_LONG, byteLength, format, irc, parse, truncate } from './protocol.ts'
+import { INPUT_TOO_LONG, byteLength, format, irc, parse, tagsLength, truncate } from './protocol.ts'
 import { connect } from './test-utils.ts'
 
 const encoder = new TextEncoder()
@@ -41,6 +41,11 @@ describe('IRC', () => {
       command: 'TAGMSG',
       params: ['#hono'],
     })
+  })
+
+  it('Should drop NUL from a tag value and measure the tags', () => {
+    expect(format({ tags: { a: 'b\0c' }, command: 'PING', params: [] })).toBe('@a=bc PING')
+    expect(tagsLength({ a: 'b c', d: '' })).toBe('a=b\\sc;d'.length)
   })
 
   it('Should format a message', () => {
@@ -120,6 +125,25 @@ describe('IRC', () => {
     const client = connect(tcp.socket(app, { protocol: irc() }))
     await client.send('PING ' + 'a'.repeat(600), 'PING b')
     expect(await client.end()).toEqual(['too long, body=""', 'PONG :b'])
+  })
+
+  it('Should keep the tags of a line that is too long, if they are whole', () => {
+    const decode = irc().decode()
+    const tooLong = (chunks: string[]) =>
+      chunks.flatMap((chunk) =>
+        [...decode(encoder.encode(chunk))].map((m) => [m.args, new TextDecoder().decode(m.body)])
+      )
+    expect(tooLong([`@label=a;+b=c PING ${'a'.repeat(600)}\r\n`])).toEqual([
+      [[INPUT_TOO_LONG], '@label=a;+b=c'],
+    ])
+    // Reported before the end of the line, from the first chunks.
+    expect(tooLong(['@label=b PI', `NG ${'a'.repeat(6000)}`, '\r\n'])).toEqual([
+      [[INPUT_TOO_LONG], '@label=b'],
+    ])
+    expect(tooLong([`@a=${'x'.repeat(4100)} PING a\r\n`, `PING ${'a'.repeat(600)}\r\n`])).toEqual([
+      [[INPUT_TOO_LONG], ''],
+      [[INPUT_TOO_LONG], ''],
+    ])
   })
 
   it('Should reply ERR_INPUTTOOLONG for an app without a route for it', async () => {

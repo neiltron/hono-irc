@@ -331,6 +331,10 @@ describe('Registries', () => {
 
   it('Should split the ISUPPORT tokens into lines of 13', async () => {
     const { server, register } = setup()
+    // The first 12 tokens of the server and 10 more, so the lines split at a known place.
+    for (const key of [...server.isupport.keys()].slice(12)) {
+      server.isupport.delete(key)
+    }
     for (let i = 0; i < 10; i++) {
       server.isupport.set(`FAKE${i}`, i % 2 ? true : String(i))
     }
@@ -541,7 +545,7 @@ describe('Targets', () => {
     const { register } = setup()
     const alice = await register('alice')
     const tokens = alice.lines.filter((line) => / 005 /.test(line)).join(' ')
-    expect(tokens).toContain(' TARGMAX=PRIVMSG:4,NOTICE:4,KICK:4,NAMES:1,WHO:1,WHOIS:1 ')
+    expect(tokens).toContain(' TARGMAX=PRIVMSG:4,NOTICE:4,TAGMSG:4,KICK:4,NAMES:1,WHO:1,WHOIS:1 ')
     expect(tokens).toContain(' AWAYLEN=300 ')
     expect(tokens).toContain(' KICKLEN=300 ')
     expect(tokens).toContain(' CHANNELLEN=50 ')
