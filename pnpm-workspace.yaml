@@ -3,7 +3,7 @@ overrides:
   vitest: 5.1.1
 
 allowBuilds:
-  'tcp-hono@https://codeload.github.com/neiltron/tcp-hono/tar.gz/e097eedd2f6c54847de20a6320260a813ff56736': true
+  'tcp-hono@https://codeload.github.com/neiltron/tcp-hono/tar.gz/8c52efb06fff770f1b5a65a8155451e53e9e4066': true
   esbuild: true
   workerd: true
   sharp: true

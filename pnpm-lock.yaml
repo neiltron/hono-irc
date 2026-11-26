@@ -16,8 +16,8 @@ importers:
         specifier: ^4.13.22
         version: 4.13.22
       tcp-hono:
-        specifier: github:neiltron/tcp-hono#e097eedd2f6c54847de20a6320260a813ff56736
-        version: https://codeload.github.com/neiltron/tcp-hono/tar.gz/e097eedd2f6c54847de20a6320260a813ff56736(hono@4.13.22)
+        specifier: github:neiltron/tcp-hono#8c52efb06fff770f1b5a65a8155451e53e9e4066
+        version: https://codeload.github.com/neiltron/tcp-hono/tar.gz/8c52efb06fff770f1b5a65a8155451e53e9e4066(hono@4.13.22)
     devDependencies:
       '@cloudflare/vite-plugin':
         specifier: ^2.0.0-rc.5
@@ -1267,8 +1267,8 @@ packages:
     resolution: {integrity: sha512-SS+jx45GF1QjgEXQx4NJZV9ImqmO2NPz5FNsIHrsDjh2YsHnawpan7SNQ1o8NuhrbHZy9AZhIoCUiCeaW/C80g==}
     engines: {node: '>=18'}
 
-  tcp-hono@https://codeload.github.com/neiltron/tcp-hono/tar.gz/e097eedd2f6c54847de20a6320260a813ff56736:
-    resolution: {gitHosted: true, integrity: sha512-zVnV/b6d3Qak6ruBgX136jqJ6o3lPg0ErNu9Yf3JN8LrWt27DlwS7ESxrOPGzkdkb7XvYNFQSpLnlVMYr1XKzg==, tarball: https://codeload.github.com/neiltron/tcp-hono/tar.gz/e097eedd2f6c54847de20a6320260a813ff56736}
+  tcp-hono@https://codeload.github.com/neiltron/tcp-hono/tar.gz/8c52efb06fff770f1b5a65a8155451e53e9e4066:
+    resolution: {gitHosted: true, integrity: sha512-2zaGcSLqHF0IPwuFL9K5YSdFOqhCa17nVc84s2zKbpIu63ZG+xJGO/FSKL/kxwNyBhL107DPg4nLwBo9tdwviw==, tarball: https://codeload.github.com/neiltron/tcp-hono/tar.gz/8c52efb06fff770f1b5a65a8155451e53e9e4066}
     version: 0.0.1
     engines: {node: '>=22.18.0'}
     peerDependencies:
@@ -2287,7 +2287,7 @@ snapshots:
 
   supports-color@10.2.2: {}
 
-  tcp-hono@https://codeload.github.com/neiltron/tcp-hono/tar.gz/e097eedd2f6c54847de20a6320260a813ff56736(hono@4.13.22):
+  tcp-hono@https://codeload.github.com/neiltron/tcp-hono/tar.gz/8c52efb06fff770f1b5a65a8155451e53e9e4066(hono@4.13.22):
     dependencies:
       hono: 4.13.22
 

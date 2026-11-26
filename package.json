@@ -16,7 +16,7 @@
   },
   "dependencies": {
     "hono": "^4.13.22",
-    "tcp-hono": "github:neiltron/tcp-hono#e097eedd2f6c54847de20a6320260a813ff56736"
+    "tcp-hono": "github:neiltron/tcp-hono#8c52efb06fff770f1b5a65a8155451e53e9e4066"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "^2.0.0-rc.5",
