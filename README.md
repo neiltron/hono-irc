@@ -3,12 +3,12 @@
 An IRC server on Cloudflare Workers and Durable Objects, built with [Hono](https://hono.dev) and [tcp-hono](https://github.com/yusukebe/tcp-hono). It also runs on Node.js.
 
 > [!WARNING]
-> This is an experiment. It has no TLS over TCP, no authentication, and no flood protection. Do not expose it as is.
+> This is an experiment. It has no TLS over TCP and no authentication, and only basic flood protection. Do not expose it as is.
 
 ```sh
 pnpm install
 pnpm dev        # Cloudflare Workers, with `cf dev`
-pnpm dev:node   # Node.js
+pnpm dev:node   # Node.js, on the port of `PORT` or 6667
 ```
 
 Connect with any IRC client to `localhost:6667` without TLS, or with a web client to `ws://localhost:5173/` (Cloudflare Workers only, see [WebSocket](#websocket)).
@@ -35,14 +35,16 @@ app.on('TCP', '/PRIVMSG/:targets/:text', (c) => { ... })
 | [`src/numerics.ts`](./src/numerics.ts)                           | The names of the numeric replies                                          |
 | [`src/state.ts`](./src/state.ts)                                 | `Client`, `Channel`, and `Server`: the state, the registries, and helpers |
 | [`src/server.ts`](./src/server.ts)                               | `createServer()`. A Hono app that does not depend on a runtime            |
+| [`src/flood.ts`](./src/flood.ts)                                 | The flood control: a token bucket for each connection                     |
 | [`src/commands/registration.ts`](./src/commands/registration.ts) | `CAP`, `NICK`, `USER`, `PASS`, `PING`, `PONG`, `QUIT`                     |
 | [`src/commands/channels.ts`](./src/commands/channels.ts)         | `JOIN`, `PART`, `TOPIC`, `NAMES`, `LIST`, `KICK`                          |
 | [`src/commands/messages.ts`](./src/commands/messages.ts)         | `PRIVMSG`, `NOTICE`, `AWAY`                                               |
 | [`src/commands/modes.ts`](./src/commands/modes.ts)               | `MODE`                                                                    |
-| [`src/commands/queries.ts`](./src/commands/queries.ts)           | `WHO`, `WHOIS`, `MOTD`, `LUSERS`                                          |
+| [`src/commands/queries.ts`](./src/commands/queries.ts)           | `WHO`, `WHOIS`, `ISON`, `USERHOST`, `MOTD`, `LUSERS`                      |
 | [`src/websocket.ts`](./src/websocket.ts)                         | The IRCv3 WebSocket transport: a WebSocket as a socket of `tcp-hono`      |
 | [`src/index.ts`](./src/index.ts)                                 | Cloudflare Workers: the Worker and the Durable Object                     |
 | [`src/node.ts`](./src/node.ts)                                   | Node.js                                                                   |
+| [`scripts/e2e.mjs`](./scripts/e2e.mjs)                           | A smoke test with a real client library, `irc-framework`                  |
 
 - Each file in `src/commands` is a Hono app, and `src/server.ts` mounts them with `app.route()`.
 - A message to a client is sent with `client.send(message)` or `channel.send(message)`. While a client's own command is handled, the messages to it, and the replies of `c.render(['332', channel, topic])`, are collected in order and written as the response. The nickname of the client is inserted into a numeric reply.
@@ -78,13 +80,20 @@ The dependency is pinned to a commit, and pnpm builds it on install. To update i
 
 ## What is implemented
 
-- Registration: `CAP`, `NICK`, `USER`, `PASS` (ignored), `PING`, `PONG`, `QUIT`
+- Registration: `CAP`, `NICK`, `USER`, `PASS` (not checked), `PING`, `PONG`, `QUIT`
 - Channels: `JOIN`, `PART`, `TOPIC`, `NAMES`, `LIST`, `KICK`, `MODE` (`+o`, `+v`, `+m`, `+n`, `+t`)
+- Users: `MODE` (`+i`: an invisible user is left out of `NAMES` and `WHO` of a channel for those outside it)
 - Messages: `PRIVMSG`, `NOTICE`, `AWAY`
-- Queries: `WHO`, `WHOIS`, `MOTD`, `LUSERS`
-- IRCv3: capability negotiation 3.2, `server-time`, `echo-message`, `multi-prefix`, `userhost-in-names`, `extended-join`, `away-notify`, and the WebSocket transport (Cloudflare Workers only)
+- Queries: `WHO`, `WHOIS`, `ISON`, `USERHOST`, `MOTD`, `LUSERS`
+- IRCv3: capability negotiation 3.2, `cap-notify`, `server-time`, `echo-message`, `multi-prefix`, `userhost-in-names`, `extended-join`, `away-notify`, and the WebSocket transport (Cloudflare Workers only)
+- `CASEMAPPING=ascii`. The lengths of `NICKLEN`, `CHANNELLEN`, `TOPICLEN`, `AWAYLEN`, and `KICKLEN` are in bytes.
+- Lines: a client can send 4096 bytes of tags and 512 bytes of the rest. A longer line gets `ERR_INPUTTOOLONG` and is dropped. A line from the server is at most 512 bytes without the tags: a longer last parameter is cut.
+- Targets: `PRIVMSG`, `NOTICE`, and `KICK` take up to four, and `NAMES`, `WHO`, and `WHOIS` one, as `TARGMAX` shows. A repeated target counts once.
 - The address of the client is passed to the server, from `CF-Connecting-IP` for a WebSocket and from the Worker for TCP (see below). It is not shown to the other users, who see a random host.
-- A client that does not answer a `PING` is disconnected.
+- A client that does not answer a `PING` is disconnected, and so is one that has not registered in time after it connected.
+- Limits, set with the options of `createServer()`:
+  - `flood`: a token bucket for each connection, by default 10 commands at once and one more every 2 seconds, with `NICK`, `JOIN`, and `PART` taking more. A client that runs out is disconnected with "Excess Flood". A client should pace itself, as irssi and WeeChat do. `false` turns it off.
+  - `maxConnections` (1000), `maxConnectionsPerIp` (10, when the runtime knows the address), and `maxChannels` (1000).
 
 ## What is not implemented
 
@@ -111,6 +120,7 @@ This has only been run locally. In production, a [Spectrum application with a Wo
 pnpm test        # vp test
 pnpm check       # vp check: format, lint, and type check
 pnpm typecheck   # with the types of Cloudflare Workers
+PORT=6701 pnpm dev:node & pnpm e2e 127.0.0.1 6701   # a smoke test with irc-framework
 ```
 
 Node.js 24 or later is required.

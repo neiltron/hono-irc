@@ -12,7 +12,8 @@
     "test": "vp test run",
     "check": "vp check",
     "format": "vp fmt",
-    "typecheck": "cf workers types && tsc --noEmit"
+    "typecheck": "cf workers types && tsc --noEmit",
+    "e2e": "node scripts/e2e.mjs"
   },
   "dependencies": {
     "hono": "^4.13.22",
@@ -22,6 +23,7 @@
     "@cloudflare/vite-plugin": "^2.0.0-rc.5",
     "@types/node": "^24.0.0",
     "cf": "^1.0.0-rc.6",
+    "irc-framework": "^4.14.0",
     "typescript": "^7.0.2",
     "vite": "npm:@voidzero-dev/vite-plus-core@8.3.8001",
     "vite-plus": "1.8.0",

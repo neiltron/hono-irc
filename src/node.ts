@@ -18,7 +18,8 @@ const listener = createListener({ allowHalfOpen: true }, (socket) => {
     { ip: socket.remoteAddress, secure: false }
   )
 })
-listener.listen(6667, () => {
-  console.log('Listening on irc://localhost:6667')
+const port = Number(process.env.PORT ?? 6667)
+listener.listen(port, () => {
+  console.log(`Listening on irc://localhost:${port}`)
 })
 setInterval(server.tick, 30_000)
