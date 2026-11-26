@@ -1,7 +1,11 @@
 import type { Context, Next } from 'hono'
 import { getConnection } from 'tcp-hono'
 import type { Connection } from 'tcp-hono'
+import { batchCost } from './commands/multiline.ts'
+import { parse } from './protocol.ts'
 import type { Client, Env, Server } from './state.ts'
+
+const decoder = new TextDecoder()
 
 type Bucket = { tokens: number; at: number; registered: boolean }
 
@@ -57,7 +61,14 @@ export const flood = (server: Server) => {
 
     // The path is the command and the parameters, each percent-encoded.
     const command = decodeURIComponent(c.req.path.split('/')[1] ?? '')
-    bucket.tokens -= client.registered ? (options.costs[command] ?? 1) : 1
+    let cost = client.registered ? (options.costs[command] ?? 1) : 1
+    if (client.inbound) {
+      // A multiline batch is charged as a whole, when it closes. The body is read as bytes, which
+      // the middleware of `server.ts` reads again from the cache.
+      const message = parse(decoder.decode(await c.req.arrayBuffer()))
+      cost = (message && batchCost(client, message)) ?? cost
+    }
+    bucket.tokens -= cost
     if (bucket.tokens < 0) {
       // The client is not silent while it waits, so the ping timeout leaves it alone.
       client.delayed = true

@@ -16,7 +16,8 @@ import type { Client, Env, Line, Server } from '../state.ts'
 
 /**
  * Deliver a message from the client to one target, with the rules of PRIVMSG: the channel must let
- * the client speak, and the user must exist.
+ * the client speak, and the user must exist. It is the decision for the whole message, which is
+ * one line or a multiline batch.
  *
  * `send(recipient, target, response)` sends the message to one recipient, with `target` as the
  * channel or the user has its name. The sender gets its own copy only with echo-message, and that

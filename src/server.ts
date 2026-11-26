@@ -4,6 +4,7 @@ import type { Socket, TCPOptions } from 'tcp-hono'
 import { channels } from './commands/channels.ts'
 import { messages } from './commands/messages.ts'
 import { modes } from './commands/modes.ts'
+import { expire, multiline } from './commands/multiline.ts'
 import { queries } from './commands/queries.ts'
 import { registration } from './commands/registration.ts'
 import { flood } from './flood.ts'
@@ -27,7 +28,7 @@ const isBatch = (message: IRCMessage, sign: '+' | '-', ref?: string) =>
 
 /**
  * Make the response to a labeled command, as labeled-response says: the label goes on the only
- * logical message of the response, which is one line or one batch; an
+ * logical message of the response, which is one line or one batch, such as a multiline echo; an
  * `ACK` is the response when there is none; and several are put in a `labeled-response` batch.
  *
  * The entries that are not part of the response stay where they are, without the label and
@@ -191,6 +192,8 @@ export const createServer = (config: ServerOptions = {}) => {
     }
   })
 
+  // First, as it takes the lines of a batch from a client, whatever their command.
+  app.route('/', multiline(server))
   app.route('/', registration(server))
   app.route('/', channels(server))
   app.route('/', messages(server))
@@ -246,6 +249,8 @@ export const createServer = (config: ServerOptions = {}) => {
         return
       }
       server.clients.delete(connection)
+      // A batch that the client has not closed is dropped.
+      client.inbound = undefined
       if (client.ip !== undefined) {
         const count = (server.addresses.get(client.ip) ?? 1) - 1
         if (count) {
@@ -288,6 +293,7 @@ export const createServer = (config: ServerOptions = {}) => {
   const tick = () => {
     const now = Date.now()
     for (const client of server.clients.values()) {
+      expire(server, client, now)
       // A client whose command waits for the flood control has sent something, which is handled
       // later, so it is not silent. A wait ends after a few tokens' time.
       const silent = client.delayed ? 0 : now - client.active

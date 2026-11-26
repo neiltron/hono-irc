@@ -57,6 +57,18 @@ export type ServerOptions = {
   maxConnectionsPerIp?: number
   /** The max number of channels on the server. */
   maxChannels?: number
+  /** The limits of a `draft/multiline` batch from a client. */
+  multiline?: MultilineOptions
+}
+
+/** The limits of a `draft/multiline` batch, which `CAP LS 302` shows. */
+export type MultilineOptions = {
+  /** The max length in bytes of the text of all its lines, with a line feed between two lines. */
+  maxBytes?: number
+  /** The max number of its lines. */
+  maxLines?: number
+  /** The milliseconds that a batch may stay open, checked by `tick()`. */
+  timeout?: number
 }
 
 /**
@@ -177,6 +189,21 @@ export const clientTags = (tags?: Record<string, string>): Record<string, string
 /** A message to the client during its own command, and whether it is part of the response. */
 export type OutboxEntry = { message: IRCMessage; response: boolean }
 
+/** A `draft/multiline` batch that a client has opened and not closed yet. */
+export type InboundBatch = {
+  ref: string
+  /** The target of the batch, which every line must have. */
+  target: string
+  /** PRIVMSG or NOTICE, from the first line. */
+  command?: 'PRIVMSG' | 'NOTICE'
+  lines: { text: string; concat: boolean }[]
+  /** The length of the combined message, as `max-bytes` counts it. */
+  bytes: number
+  /** The client-only tags of the `BATCH +` line, which are relayed with the message. */
+  tags: Record<string, string>
+  opened: number
+}
+
 export class Client {
   nick = '*'
   user = ''
@@ -211,6 +238,8 @@ export class Client {
    * opens it and writes it as the response, so they are not pushed. `undefined` otherwise.
    */
   outbox?: OutboxEntry[]
+  /** The `draft/multiline` batch that the client is sending, if any. */
+  inbound?: InboundBatch
   // The last reference tag of a batch to this client, which is unique for the connection.
   #references = 0
 
@@ -324,7 +353,7 @@ export class Channel {
     this.name = name
   }
 
-  /** Whether the client may send a message to the channel: PRIVMSG, NOTICE, or TAGMSG. */
+  /** Whether the client may send a message to the channel: PRIVMSG, NOTICE, TAGMSG, or multiline. */
   canSend(client: Client) {
     const ranks = this.members.get(client)
     return !(
@@ -363,6 +392,7 @@ export class Server {
   maxConnections: number
   maxConnectionsPerIp: number
   maxChannels: number
+  multiline: Required<MultilineOptions>
   created = new Date()
 
   clients = new Map<Connection, Client>()
@@ -425,6 +455,11 @@ export class Server {
     this.maxConnections = config.maxConnections ?? 1000
     this.maxConnectionsPerIp = config.maxConnectionsPerIp ?? 10
     this.maxChannels = config.maxChannels ?? 1000
+    this.multiline = {
+      maxBytes: config.multiline?.maxBytes ?? 4096,
+      maxLines: config.multiline?.maxLines ?? 100,
+      timeout: config.multiline?.timeout ?? 30_000,
+    }
     this.isupport = new Map<string, string | true>([
       ['CASEMAPPING', 'ascii'],
       ['CHANTYPES', '#'],

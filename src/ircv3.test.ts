@@ -7,7 +7,7 @@ import { Client, Server, fail, msg } from './state.ts'
 import { connect } from './test-utils.ts'
 
 // The IRCv3 extensions around message tags: message-tags, message-ids, batch, labeled-response,
-// and standard-replies.
+// standard-replies, and draft/multiline.
 
 const setup = (config?: ServerOptions) => {
   const server = createServer({ name: 'irc.example', flood: false, ...config })
@@ -26,6 +26,8 @@ const setup = (config?: ServerOptions) => {
 }
 
 type TestClient = ReturnType<typeof connect>
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 let sentinel = 0
 
@@ -58,15 +60,18 @@ const join = async (client: TestClient, channel: string) => {
   await exchange(client, `JOIN ${channel}`)
 }
 
+const MULTILINE = ['batch', 'draft/multiline', 'echo-message', 'labeled-response', 'message-tags']
+
 describe('Registries of the IRCv3 extensions', () => {
   it('Should advertise the capabilities and the ISUPPORT tokens', async () => {
-    const { register, handler } = setup()
+    const { register, handler } = setup({ multiline: { maxBytes: 10, maxLines: 3 } })
     const client = connect(handler)
     await client.send('CAP LS 302')
     const ls = await client.waitFor(/ CAP /)
     for (const cap of ['message-tags', 'batch', 'labeled-response', 'standard-replies']) {
       expect(ls).toMatch(new RegExp(`[ :]${cap}( |$)`))
     }
+    expect(ls).toContain(' draft/multiline=max-bytes=10,max-lines=3')
     const alice = await register('alice')
     const tokens = alice.lines.filter((line) => / 005 /.test(line)).join(' ')
     expect(tokens).toContain(' CLIENTTAGDENY= ')
@@ -75,8 +80,8 @@ describe('Registries of the IRCv3 extensions', () => {
   it('Should not enforce the order of the capabilities that depend on batch', async () => {
     const { register } = setup()
     const alice = await register('alice')
-    expect(await exchange(alice, 'CAP REQ :labeled-response')).toEqual([
-      ':irc.example CAP alice ACK labeled-response',
+    expect(await exchange(alice, 'CAP REQ :labeled-response draft/multiline')).toEqual([
+      ':irc.example CAP alice ACK :labeled-response draft/multiline',
     ])
     // Without batch, labeled-response is not used yet.
     expect(await exchange(alice, '@label=a PONG x')).toEqual([])
@@ -441,5 +446,299 @@ describe('standard-replies', () => {
       'ref',
       'Timed out',
     ])
+  })
+})
+
+describe('draft/multiline', () => {
+  /** The lines of the example of the spec, to `target`. */
+  const example = (target: string, ref = '123') => [
+    `@+reply=abc BATCH +${ref} draft/multiline ${target}`,
+    `@batch=${ref} PRIVMSG ${target} hello`,
+    `@batch=${ref} PRIVMSG ${target} :`,
+    `@batch=${ref} privmsg ${target} :how is `,
+    `@batch=${ref};draft/multiline-concat PRIVMSG ${target} :everyone?`,
+  ]
+
+  it('Should deliver a batch to each client as it can take it', async () => {
+    const { register } = setup()
+    const alice = await register('alice', MULTILINE)
+    const bob = await register('bob', ['batch', 'draft/multiline', 'message-tags'])
+    const carol = await register('carol')
+    const dave = await register('dave', ['message-tags', 'batch'])
+    for (const client of [alice, bob, carol, dave]) {
+      await join(client, '#a')
+    }
+    expect(await exchange(alice, ...example('#a'))).toEqual([])
+    const echo = await exchange(alice, '@label=m BATCH -123')
+    expect(echo.map(norm)).toEqual([
+      '@msgid=ID;label=m;+reply=abc :alice BATCH +1 draft/multiline #a',
+      '@batch=1 :alice PRIVMSG #a hello',
+      '@batch=1 :alice PRIVMSG #a :',
+      '@batch=1 :alice PRIVMSG #a :how is ',
+      '@batch=1;draft/multiline-concat :alice PRIVMSG #a everyone?',
+      ':alice BATCH -1',
+    ])
+    await bob.waitFor(/ BATCH -/)
+    await carol.waitFor(/everyone/)
+    await dave.waitFor(/everyone/)
+    const relayed = (client: TestClient) =>
+      client.lines.filter((line) => / (BATCH|PRIVMSG) /.test(line)).map(norm)
+    expect(relayed(bob)).toEqual([
+      '@msgid=ID;+reply=abc :alice BATCH +1 draft/multiline #a',
+      '@batch=1 :alice PRIVMSG #a hello',
+      '@batch=1 :alice PRIVMSG #a :',
+      '@batch=1 :alice PRIVMSG #a :how is ',
+      '@batch=1;draft/multiline-concat :alice PRIVMSG #a everyone?',
+      ':alice BATCH -1',
+    ])
+    // Without the capability: no blank line, the concatenated line on its own, and the tags of the
+    // batch on the first line only.
+    expect(relayed(carol)).toEqual([
+      ':alice PRIVMSG #a hello',
+      ':alice PRIVMSG #a :how is ',
+      ':alice PRIVMSG #a everyone?',
+    ])
+    expect(relayed(dave)).toEqual([
+      '@msgid=ID;+reply=abc :alice PRIVMSG #a hello',
+      ':alice PRIVMSG #a :how is ',
+      ':alice PRIVMSG #a everyone?',
+    ])
+    // The same ID on the echo, the batch of bob, and the first line of the fallback of dave.
+    const ids = [
+      echo[0],
+      bob.lines.find((line) => line.includes('BATCH +'))!,
+      dave.lines.find((line) => / PRIVMSG #a hello/.test(line))!,
+    ].map((line) => tagsOf(line).msgid)
+    expect(ids[0]).toBeTruthy()
+    expect(new Set(ids).size).toBe(1)
+  })
+
+  it('Should ACK the lines of a batch, and accept NOTICE', async () => {
+    const { register } = setup()
+    const alice = await register('alice', MULTILINE)
+    const bob = await register('bob')
+    expect(
+      await exchange(
+        alice,
+        '@label=1 BATCH +n draft/multiline bob',
+        '@batch=n;label=2 NOTICE bob :one',
+        'BATCH -n'
+      )
+    ).toEqual([
+      '@label=1 :irc.example ACK',
+      '@label=2 :irc.example ACK',
+      expect.stringMatching(/BATCH \+1/),
+      expect.stringMatching(/NOTICE bob one/),
+      expect.stringMatching(/BATCH -1/),
+    ])
+    expect(norm(await bob.waitFor(/ NOTICE /))).toBe(':alice NOTICE bob one')
+  })
+
+  it('Should check the target once for the whole message', async () => {
+    const { register } = setup()
+    const alice = await register('alice', MULTILINE)
+    const bob = await register('bob')
+    await exchange(bob, 'JOIN #n', 'AWAY :lunch')
+    const batch = (target: string, command = 'PRIVMSG') => [
+      `BATCH +b draft/multiline ${target}`,
+      `@batch=b ${command} ${target} :one`,
+      `@batch=b ${command} ${target} :two`,
+      `@batch=b ${command} ${target} :three`,
+      'BATCH -b',
+    ]
+    const errors = (lines: string[]) => lines.filter((line) => / \d{3} /.test(line))
+    expect(errors(await exchange(alice, ...batch('#n')))).toEqual([
+      ':irc.example 404 alice #n :Cannot send to channel',
+    ])
+    expect(errors(await exchange(alice, ...batch('nobody')))).toEqual([
+      ':irc.example 401 alice nobody :No such nick/channel',
+    ])
+    expect(errors(await exchange(alice, ...batch('bob')))).toEqual([
+      ':irc.example 301 alice bob lunch',
+    ])
+    expect(errors(await exchange(alice, ...batch('bob', 'NOTICE')))).toEqual([])
+    expect(errors(await exchange(alice, ...batch('a,b,c,d,e')))).toEqual([
+      ':irc.example 401 alice a :No such nick/channel',
+      ':irc.example 401 alice b :No such nick/channel',
+      ':irc.example 401 alice c :No such nick/channel',
+      ':irc.example 401 alice d :No such nick/channel',
+      ':irc.example 407 alice e :Too many targets',
+    ])
+    expect(bob.lines.filter((line) => / PRIVMSG /.test(line))).toHaveLength(3)
+  })
+
+  it('Should reply FAIL to a batch that breaks a rule, and ignore the rest of it', async () => {
+    const { register } = setup({ multiline: { maxBytes: 10, maxLines: 3 } })
+    const alice = await register('alice', MULTILINE)
+    const bob = await register('bob')
+    const open = (ref: string) => `BATCH +${ref} draft/multiline bob`
+    const cases: [string[], string][] = [
+      [
+        [open('a'), '@batch=a PRIVMSG carol :hi'],
+        'MULTILINE_INVALID_TARGET bob carol :Invalid multiline target',
+      ],
+      [
+        [open('a'), '@batch=a PRIVMSG bob :hello', '@batch=a PRIVMSG bob :world'],
+        'MULTILINE_MAX_BYTES 10 :Multiline batch max-bytes exceeded',
+      ],
+      [
+        [open('a'), ...['a', 'b', 'c', 'd'].map((text) => `@batch=a PRIVMSG bob ${text}`)],
+        'MULTILINE_MAX_LINES 3 :Multiline batch max-lines exceeded',
+      ],
+      [
+        [open('a'), '@batch=a PRIVMSG bob :a ', '@batch=a;draft/multiline-concat PRIVMSG bob :'],
+        'MULTILINE_INVALID :Invalid multiline batch with concatenated blank line',
+      ],
+      [
+        [open('a'), '@batch=a PRIVMSG bob :', '@batch=a PRIVMSG bob :', 'BATCH -a'],
+        'MULTILINE_INVALID :Invalid multiline batch with blank lines only',
+      ],
+      [[open('a'), 'BATCH -a'], 'MULTILINE_INVALID :Invalid multiline batch'],
+      [
+        [open('a'), '@batch=a PRIVMSG bob :one', '@batch=a NOTICE bob :two'],
+        'MULTILINE_INVALID :Invalid multiline batch with PRIVMSG and NOTICE',
+      ],
+      [[open('a'), '@batch=a JOIN #a'], 'MULTILINE_INVALID :Invalid multiline batch with JOIN'],
+      [
+        [open('a'), '@batch=a BATCH +b draft/multiline bob'],
+        'MULTILINE_INVALID :Invalid multiline batch: a batch can not be nested',
+      ],
+      [['BATCH +a draft/multiline'], 'MULTILINE_INVALID :Invalid multiline batch: no target'],
+      [[open('a_b')], 'INVALID_REFTAG a_b :Invalid reference tag'],
+      [
+        ['BATCH +a chathistory bob'],
+        'UNKNOWN_TYPE a chathistory :Unknown or unnegotiated batch type',
+      ],
+    ]
+    for (const [lines, reply] of cases) {
+      // The lines that follow the failure, and the end of the batch, are ignored.
+      const replies = await exchange(alice, ...lines, '@batch=a PRIVMSG bob :late', 'BATCH -a')
+      expect(replies).toEqual([`:irc.example FAIL BATCH ${reply}`])
+    }
+    await exchange(alice, open('a'), '@batch=a PRIVMSG bob :ok')
+    expect(await exchange(alice, open('b'))).toEqual([
+      ':irc.example FAIL BATCH MULTILINE_INVALID :Invalid multiline batch: another batch is open',
+    ])
+    // The lines of a batch that is not open are ignored.
+    expect(await exchange(alice, '@batch=b PRIVMSG bob :ignored', 'BATCH -b')).toEqual([])
+    const done = await exchange(alice, 'BATCH -a')
+    expect(done.map(norm)).toEqual([
+      '@msgid=ID :alice BATCH +1 draft/multiline bob',
+      '@batch=1 :alice PRIVMSG bob ok',
+      ':alice BATCH -1',
+    ])
+    await exchange(bob, 'PING x')
+    expect(bob.lines.filter((line) => / PRIVMSG /.test(line)).map(norm)).toEqual([
+      ':alice PRIVMSG bob ok',
+    ])
+  })
+
+  it('Should accept a batch of exactly max-bytes and max-lines', async () => {
+    const { register } = setup({ multiline: { maxBytes: 10, maxLines: 3 } })
+    const alice = await register('alice', MULTILINE)
+    const bob = await register('bob', ['batch', 'draft/multiline'])
+    // 4 + 1 + 1 + 4 bytes, as a concatenated line has no line feed.
+    await exchange(
+      alice,
+      'BATCH +a draft/multiline bob',
+      '@batch=a PRIVMSG bob :abcd',
+      '@batch=a PRIVMSG bob :e',
+      '@batch=a;draft/multiline-concat PRIVMSG bob :fghi',
+      'BATCH -a'
+    )
+    expect(await bob.waitFor(/ BATCH -/)).toMatch(/BATCH -1$/)
+  })
+
+  it('Should reject a batch from a client that has not negotiated it', async () => {
+    const { register } = setup()
+    const alice = await register('alice', ['draft/multiline'])
+    expect(await exchange(alice, 'BATCH +a draft/multiline bob')).toEqual([
+      ':irc.example FAIL BATCH UNKNOWN_TYPE a draft/multiline :Unknown or unnegotiated batch type',
+    ])
+  })
+
+  it('Should fail a batch that is left open, and drop it on a disconnection', async () => {
+    const { server, register } = setup({ multiline: { timeout: 10 } })
+    const alice = await register('alice', MULTILINE)
+    const bob = await register('bob')
+    await exchange(alice, 'BATCH +t draft/multiline bob', '@batch=t PRIVMSG bob :one')
+    await sleep(20)
+    server.tick()
+    expect(await alice.waitFor(/ FAIL /)).toBe(
+      ':irc.example FAIL BATCH TIMEOUT t :Multiline batch timed out'
+    )
+    expect(await exchange(alice, '@batch=t PRIVMSG bob :two', 'BATCH -t')).toEqual([])
+
+    await exchange(alice, 'BATCH +u draft/multiline bob', '@batch=u PRIVMSG bob :three')
+    const client = [...server.clients.values()].find(({ nick }) => nick === 'alice')!
+    expect(client.inbound?.lines).toEqual([{ text: 'three', concat: false }])
+    await alice.drop()
+    await alice.closed
+    expect(client.inbound).toBeUndefined()
+    await exchange(bob, 'PING x')
+    expect(bob.lines.filter((line) => / PRIVMSG /.test(line))).toEqual([])
+  })
+
+  it('Should fail a batch that has a line too long', async () => {
+    const { register } = setup()
+    const alice = await register('alice', MULTILINE)
+    await register('bob')
+    expect(
+      await exchange(
+        alice,
+        'BATCH +a draft/multiline bob',
+        `@batch=a PRIVMSG bob :${'x'.repeat(600)}`,
+        'BATCH -a'
+      )
+    ).toEqual([
+      ':irc.example 417 alice :Input line was too long',
+      ':irc.example FAIL BATCH MULTILINE_INVALID :Invalid multiline batch with a line too long',
+    ])
+  })
+
+  it('Should label the batch of the echo, in a labeled-response batch with other replies', async () => {
+    const { register } = setup()
+    const alice = await register('alice', MULTILINE)
+    const bob = await register('bob')
+    await exchange(bob, 'AWAY :lunch')
+    await exchange(alice, 'BATCH +a draft/multiline bob', '@batch=a PRIVMSG bob :one')
+    expect((await exchange(alice, '@label=x BATCH -a')).map(norm)).toEqual([
+      '@label=x :irc.example BATCH +2 labeled-response',
+      '@msgid=ID;batch=2 :alice BATCH +1 draft/multiline bob',
+      '@batch=1 :alice PRIVMSG bob one',
+      '@batch=2 :alice BATCH -1',
+      '@batch=2 :irc.example 301 alice bob lunch',
+      ':irc.example BATCH -2',
+    ])
+    // To oneself: the delivered batch first, then the labeled echo.
+    await exchange(alice, 'BATCH +b draft/multiline alice', '@batch=b PRIVMSG alice :me')
+    expect((await exchange(alice, '@label=y BATCH -b')).map(norm)).toEqual([
+      '@msgid=ID :alice BATCH +3 draft/multiline alice',
+      '@batch=3 :alice PRIVMSG alice me',
+      ':alice BATCH -3',
+      '@msgid=ID;label=y :alice BATCH +4 draft/multiline alice',
+      '@batch=4 :alice PRIVMSG alice me',
+      ':alice BATCH -4',
+    ])
+  })
+
+  it('Should charge a batch as a whole by the flood control', async () => {
+    const { register } = setup({ flood: { burst: 10, interval: 100 } })
+    const alice = await register('alice', MULTILINE)
+    const bob = await register('bob')
+    const batch = (ref: string) => [
+      `BATCH +${ref} draft/multiline bob`,
+      ...Array.from({ length: 30 }, (_, i) => `@batch=${ref} PRIVMSG bob :${ref}${i}`),
+      `BATCH -${ref}`,
+    ]
+    // 30 lines are 6 tokens, so the first batch is not delayed, and the second one is.
+    let start = Date.now()
+    await alice.send(...batch('a'))
+    await bob.waitFor(/ a29$/)
+    expect(Date.now() - start).toBeLessThan(250)
+    start = Date.now()
+    await alice.send(...batch('b'))
+    await bob.waitFor(/ b29$/, 2000)
+    expect(Date.now() - start).toBeGreaterThanOrEqual(250)
   })
 })
