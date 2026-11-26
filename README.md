@@ -3,7 +3,7 @@
 An IRC server on Cloudflare Workers and Durable Objects, built with [Hono](https://hono.dev) and [tcp-hono](https://github.com/yusukebe/tcp-hono). It also runs on Node.js.
 
 > [!WARNING]
-> This is an experiment. It has no TLS, no authentication, and no flood protection. Do not expose it as is.
+> This is an experiment. It has no TLS over TCP, no authentication, and no flood protection. Do not expose it as is.
 
 ```sh
 pnpm install
@@ -11,7 +11,7 @@ pnpm dev        # Cloudflare Workers, with `cf dev`
 pnpm dev:node   # Node.js
 ```
 
-Connect with any IRC client to `localhost:6667` without TLS.
+Connect with any IRC client to `localhost:6667` without TLS, or with a web client to `ws://localhost:5173/` (Cloudflare Workers only, see [WebSocket](#websocket)).
 
 ```sh
 $ nc -C localhost 6667
@@ -40,6 +40,7 @@ app.on('TCP', '/PRIVMSG/:targets/:text', (c) => { ... })
 | [`src/commands/messages.ts`](./src/commands/messages.ts)         | `PRIVMSG`, `NOTICE`, `AWAY`                                               |
 | [`src/commands/modes.ts`](./src/commands/modes.ts)               | `MODE`                                                                    |
 | [`src/commands/queries.ts`](./src/commands/queries.ts)           | `WHO`, `WHOIS`, `MOTD`, `LUSERS`                                          |
+| [`src/websocket.ts`](./src/websocket.ts)                         | The IRCv3 WebSocket transport: a WebSocket as a socket of `tcp-hono`      |
 | [`src/index.ts`](./src/index.ts)                                 | Cloudflare Workers: the Worker and the Durable Object                     |
 | [`src/node.ts`](./src/node.ts)                                   | Node.js                                                                   |
 
@@ -49,7 +50,25 @@ app.on('TCP', '/PRIVMSG/:targets/:text', (c) => { ... })
 - A message tag is sent only to a client that has the capability of the tag, such as `server-time` for `time`. The capabilities, the `RPL_ISUPPORT` tokens, and the tags are registered in `Server`.
 - A runtime hands over a socket with `connect(socket, info)` of the server.
 - On Cloudflare Workers, the `connect()` handler of the Worker pipes the socket to the `connect()` handler of one Durable Object. The object holds all the connections, which is why a message from a client can be written to the sockets of the others.
+- A WebSocket goes to the same object: the `fetch()` handler of the Worker forwards the upgrade request to it, and `fromWebSocket()` of `src/websocket.ts` turns the WebSocket into a socket for the same `connect()` of the server. A WebSocket client and a TCP client are in the same channels.
 - The users and the channels are in memory. An IRC channel disappears when the last member leaves, so nothing needs to be stored as long as the Durable Object stays in memory while it has a connection. A deploy or a restart of the object disconnects everyone, and the clients reconnect.
+
+## WebSocket
+
+The Worker serves the [IRCv3 WebSocket transport](https://ircv3.net/specs/extensions/websocket) at `/`, which web clients such as [gamja](https://codeberg.org/emersion/gamja) speak. A `GET /` without an upgrade describes the server in plain text.
+
+- `pnpm dev` serves it at `ws://localhost:5173/`. Deployed, it is `wss://hono-irc.<subdomain>.workers.dev/`, which has TLS on any plan.
+- Each WebSocket message is one IRC line without CRLF. The subprotocols are `text.ircv3.net` (text messages, UTF-8; the bytes that are not UTF-8 become U+FFFD) and `binary.ircv3.net` (binary messages, any bytes). The first one that the client offers wins. A client that offers neither is accepted without a subprotocol, and gets the type of its own first message, or text before that.
+- A message with a line break inside, or longer than 8701 bytes, closes the connection. So does a client that sends faster than the server reads, or does not read what is sent to it, beyond 1 MiB, like `maxBufferedBytes` of `tcp-hono` for TCP.
+- Any `Origin` is allowed. The server reads no cookies and no HTTP authentication, so a page on another origin can do nothing that it could not do by connecting directly. `src/index.ts` explains it.
+- The object accepts the WebSocket with `accept()`, not with the hibernation API, because the state is in memory and a hibernated object would lose it.
+
+To try it with gamja, run gamja from its repository and open it with the URL parameter `server`, e.g. `http://localhost:8080/?server=ws://localhost:5173/` (the port is the one of the gamja server). It has not been tried with gamja; the tests use a WebSocket client of Node.js.
+
+Under `cf dev`, the WebSocket goes through a proxy of the Vite plugin, which differs from Cloudflare in two ways:
+
+- It answers the client with the first subprotocol that the client offers, whatever the Worker chose, and fails the connection when the Worker answers with none. So a client whose first offer is neither IRCv3 subprotocol is told that one, while the server uses the one it negotiated, and a client that offers only unknown subprotocols cannot connect. A client that offers no subprotocol, or an IRCv3 one first, is not affected.
+- The address of every WebSocket client is `127.0.0.1`, and a client can set it, and `https`, with the headers `CF-Connecting-IP` and `X-Forwarded-Proto`. On Cloudflare, these come from the edge.
 
 ## The fork of tcp-hono
 
@@ -63,19 +82,28 @@ The dependency is pinned to a commit, and pnpm builds it on install. To update i
 - Channels: `JOIN`, `PART`, `TOPIC`, `NAMES`, `LIST`, `KICK`, `MODE` (`+o`, `+v`, `+m`, `+n`, `+t`)
 - Messages: `PRIVMSG`, `NOTICE`, `AWAY`
 - Queries: `WHO`, `WHOIS`, `MOTD`, `LUSERS`
-- IRCv3: capability negotiation 3.2, `server-time`, `echo-message`, `multi-prefix`, `userhost-in-names`, `extended-join`, `away-notify`
+- IRCv3: capability negotiation 3.2, `server-time`, `echo-message`, `multi-prefix`, `userhost-in-names`, `extended-join`, `away-notify`, and the WebSocket transport (Cloudflare Workers only)
+- The address of the client is passed to the server, from `CF-Connecting-IP` for a WebSocket and from the Worker for TCP (see below). It is not shown to the other users, who see a random host.
 - A client that does not answer a `PING` is disconnected.
 
 ## What is not implemented
 
-- TLS. According to the Cloudflare documentation, Spectrum terminates TLS for a Worker only with the Enterprise add-on, and `startTls()` is not supported for an inbound socket.
+- TLS over TCP. According to the Cloudflare documentation, Spectrum terminates TLS for a Worker only with the Enterprise add-on, and `startTls()` is not supported for an inbound socket. A WebSocket has TLS (`wss://`) once deployed, which has not been tried.
 - Accounts (`SASL`), bans, invites, keys, operators, and server-to-server links.
-- The address of the client. The Durable Object does not see it. Node.js passes it to the server, but it is not shown, so every user gets a random host.
-- The other IRCv3 extensions, such as `message-tags`, `batch`, `labeled-response`, `chathistory`, and the WebSocket transport.
+- The WebSocket transport on Node.js, which has no WebSocket server built in. `src/websocket.ts` does not depend on a runtime.
+- The other IRCv3 extensions, such as `message-tags`, `batch`, `labeled-response`, and `chathistory`.
+
+## The address of the client
+
+For a WebSocket, the address is `CF-Connecting-IP`, which Cloudflare sets. Under `cf dev`, it is `127.0.0.1` (see [WebSocket](#websocket)).
+
+The Durable Object does not see a TCP client: the Worker pipes the socket to it. So the Worker connects to the object with the address of the client, `remoteAddress` of its socket (`192.0.2.1:4242` or `[2001:db8::1]:4242`), as the address to connect to, which the object receives as `localAddress`. Only the Worker sets it, so the bytes from a client can not forge it. When `remoteAddress` is missing, which the documentation allows for a connection from Spectrum, the address is unknown.
+
+This has been tried under `cf dev` with IPv4 clients, and the address strings of IPv6 have been passed through `connect()`, but not from an IPv6 client. It has not been tried deployed.
 
 ## Deploying
 
-This has only been run locally. In production, a [Spectrum application with a Worker origin](https://developers.cloudflare.com/spectrum/how-to/route-tcp-traffic-to-a-worker/) routes a TCP port of a hostname to the `connect()` handler. It needs a paid zone.
+This has only been run locally. In production, a [Spectrum application with a Worker origin](https://developers.cloudflare.com/spectrum/how-to/route-tcp-traffic-to-a-worker/) routes a TCP port of a hostname to the `connect()` handler. It needs a paid zone. The WebSocket transport needs only the Worker, on workers.dev or a custom domain.
 
 ## Development
 
