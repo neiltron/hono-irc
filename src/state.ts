@@ -38,7 +38,14 @@ import { CROCKFORD, History, encodeTime } from './history.ts'
 import type { HistoryOptions } from './history.ts'
 import { compile, matches } from './masks.ts'
 import type { Glob } from './masks.ts'
-import { MAX_LINE_LENGTH, MAX_TAG_DATA, byteLength, format, tagsLength } from './protocol.ts'
+import {
+  MAX_LINE_LENGTH,
+  MAX_TAG_DATA,
+  byteLength,
+  format,
+  isClientTagKey,
+  tagsLength,
+} from './protocol.ts'
 import type { IRCMessage } from './protocol.ts'
 import { memoryStore, migrate } from './store.ts'
 import type { Store } from './store.ts'
@@ -254,13 +261,14 @@ export const note = (command: string, code: string, ...rest: [...string[], strin
 /**
  * The client-only tags (`+name`) of a message from a client, which are relayed with it. The other
  * tags of a client are never relayed: `time`, `msgid`, `batch`, `label` and the like are set by the
- * server, or read by it. `undefined` if they would take more than 4094 bytes on a line, which can
- * happen only with a raw CR in a value, as it is escaped to two bytes: the line is then too long.
+ * server, or read by it. A key that is not of the grammar of message-tags, such as one with a
+ * control character, is dropped, so a client can not make another client read a line differently.
+ * `undefined` if they would take more than 4094 bytes on a line: the line is then too long.
  */
 export const clientTags = (tags?: Record<string, string>): Record<string, string> | undefined => {
   const result: Record<string, string> = {}
   for (const [key, value] of Object.entries(tags ?? {})) {
-    if (key[0] === '+' && key.length > 1) {
+    if (isClientTagKey(key)) {
       result[key] = value
     }
   }

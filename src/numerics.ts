@@ -52,6 +52,8 @@ export const RPL_MOTD = '372'
 export const RPL_MOTDSTART = '375'
 export const RPL_ENDOFMOTD = '376'
 
+// `<client> <command> :<info>`, for an error that has no numeric of its own.
+export const ERR_UNKNOWNERROR = '400'
 export const ERR_NOSUCHNICK = '401'
 export const ERR_NOSUCHCHANNEL = '403'
 export const ERR_CANNOTSENDTOCHAN = '404'

@@ -14,7 +14,12 @@ import { registration } from './commands/registration.ts'
 import { sasl } from './commands/sasl.ts'
 import { setname } from './commands/setname.ts'
 import { flood } from './flood.ts'
-import { ERR_INPUTTOOLONG, ERR_NOTREGISTERED, ERR_UNKNOWNCOMMAND } from './numerics.ts'
+import {
+  ERR_INPUTTOOLONG,
+  ERR_NOTREGISTERED,
+  ERR_UNKNOWNCOMMAND,
+  ERR_UNKNOWNERROR,
+} from './numerics.ts'
 import { INPUT_TOO_LONG, byteLength, format, irc, parse, parseTags } from './protocol.ts'
 import type { IRCMessage } from './protocol.ts'
 import { Client, Server, fail, msg } from './state.ts'
@@ -134,6 +139,10 @@ export const createServer = (config: ServerOptions = {}) => {
       utf8 = tooLong
       text = tooLong ? '' : lenient.decode(bytes)
     }
+    // A NUL, or a CR that does not end the line, is allowed nowhere in a message. The line is
+    // rejected as a whole, as one that is not UTF-8 is, rather than read in a way that another
+    // client, which may split lines on a CR, would read differently.
+    const forbidden = utf8 && !tooLong && /[\0\r]/.test(text)
     let message: IRCMessage = (tooLong
       ? { ...(text && { tags: parseTags(text.slice(1)) }), command: INPUT_TOO_LONG, params: [] }
       : parse(text)) ?? { command: INPUT_TOO_LONG, params: [] }
@@ -146,7 +155,8 @@ export const createServer = (config: ServerOptions = {}) => {
       client.capabilities.has('batch')
         ? message.tags.label
         : undefined
-    if (!utf8 && message.command === 'QUIT') {
+    const valid = utf8 && !forbidden
+    if (!valid && message.command === 'QUIT') {
       // A client that quits is let go, without its reason.
       message = { ...message, params: [] }
     }
@@ -160,7 +170,7 @@ export const createServer = (config: ServerOptions = {}) => {
     // command that its handler will get: not for a line that is not UTF-8, a command that is not
     // allowed yet, or a line of a multiline batch, which the batch takes.
     const prepare =
-      utf8 &&
+      valid &&
       message.tags?.batch === undefined &&
       (client.registered || server.beforeRegistration.has(message.command))
         ? server.prepare.get(message.command)
@@ -204,21 +214,29 @@ export const createServer = (config: ServerOptions = {}) => {
     client.outbox = outbox
     let handled: Promise<void> | undefined
     try {
-      if (!utf8 && message.command !== 'QUIT') {
+      if (!valid && message.command !== 'QUIT') {
         // The line is not relayed, and the client stays. If it was part of a multiline batch, the
         // batch has lost a line, so it fails too.
         const command = /^[A-Za-z0-9]+$/.test(message.command) ? message.command : '*'
         c.render(
-          fail(
-            command,
-            'INVALID_UTF8',
-            'Message rejected, your IRC software MUST use UTF-8 encoding on this network'
-          )
+          utf8
+            ? [ERR_UNKNOWNERROR, command, 'Line contains a forbidden character (NUL or CR)']
+            : fail(
+                command,
+                'INVALID_UTF8',
+                'Message rejected, your IRC software MUST use UTF-8 encoding on this network'
+              )
         )
         if (client.inbound && client.inbound.ref === message.tags?.batch) {
           client.inbound = undefined
           c.render(
-            fail('BATCH', 'MULTILINE_INVALID', 'Invalid multiline batch with a line not UTF-8')
+            fail(
+              'BATCH',
+              'MULTILINE_INVALID',
+              utf8
+                ? 'Invalid multiline batch with a forbidden character'
+                : 'Invalid multiline batch with a line not UTF-8'
+            )
           )
         }
       } else if (!client.registered && !server.beforeRegistration.has(message.command)) {

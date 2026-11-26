@@ -169,7 +169,8 @@ describe('REGISTER', () => {
       ':irc.example FAIL REGISTER ACCOUNT_NAME_MUST_BE_NICK bob :The account name must be your current nickname',
       ':irc.example FAIL REGISTER WEAK_PASSWORD alice :The password must have at least 8 bytes and not be the account name',
       ':irc.example FAIL REGISTER UNACCEPTABLE_PASSWORD alice :The password must have at most 300 bytes and no NUL',
-      ':irc.example FAIL REGISTER UNACCEPTABLE_PASSWORD alice :The password must have at most 300 bytes and no NUL',
+      // A NUL is allowed nowhere in a line, which is rejected before REGISTER sees it.
+      ':irc.example 400 alice REGISTER :Line contains a forbidden character (NUL or CR)',
     ])
     expect((await exchange(longname, 'REGISTER * * LONGNAME1'))[0]).toContain(' WEAK_PASSWORD ')
 

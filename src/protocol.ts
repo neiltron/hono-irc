@@ -36,14 +36,31 @@ export const parseTags = (data: string): Record<string, string> => {
   return tags
 }
 
+/**
+ * A client-only tag key of the message-tags grammar: `+`, an optional vendor, which is a host name,
+ * and `/`, and a name of ASCII letters, digits, and hyphens, e.g. `+typing` or `+example.com/foo`.
+ */
+const CLIENT_TAG_KEY = /^\+(?:[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\/)?[A-Za-z0-9-]+$/
+
+export const isClientTagKey = (key: string) => CLIENT_TAG_KEY.test(key)
+
+// A key that would break the line, or change what it means, is never written. The tags of the
+// server are well-formed, and the client-only ones are checked when they come in.
+const UNSAFE_KEY = /[\0\r\n ;=@]/
+
 // The tag data of a line, between `@` and the space. A tag with an empty value is sent without
 // one, as the spec allows: `a` for `a=`.
 const formatTags = (tags: [string, string][]) =>
-  tags.map(([k, v]) => (v === '' ? k : `${k}=${escapeTag(v)}`)).join(';')
+  tags
+    .filter(([k]) => k && !UNSAFE_KEY.test(k))
+    .map(([k, v]) => (v === '' ? k : `${k}=${escapeTag(v)}`))
+    .join(';')
+
+/** The tag data of the tags as on a line, without `@` and the space, which `parseTags()` reads. */
+export const formatTagData = (tags: Record<string, string>) => formatTags(Object.entries(tags))
 
 /** The length in bytes of the tag data that the tags take on a line, without `@` and the space. */
-export const tagsLength = (tags: Record<string, string>): number =>
-  byteLength(formatTags(Object.entries(tags)))
+export const tagsLength = (tags: Record<string, string>): number => byteLength(formatTagData(tags))
 
 /**
  * Parse a line without the line terminator. Returns `undefined` if the line has no command.
@@ -162,8 +179,8 @@ const formatBody = (message: IRCMessage): string => {
  * on a character boundary, and if that is not enough, the line itself is cut.
  */
 export const format = (message: IRCMessage, max?: number): string => {
-  const tags = Object.entries(message.tags ?? {})
-  const head = tags.length ? '@' + formatTags(tags) + ' ' : ''
+  const data = formatTagData(message.tags ?? {})
+  const head = data ? '@' + data + ' ' : ''
   let body = formatBody(message)
   if (max !== undefined && byteLength(body) > max && message.params.length) {
     const params = [...message.params]

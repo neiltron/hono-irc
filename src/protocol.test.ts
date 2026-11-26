@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vite-plus/test'
 import { Hono, getConnection, tcp } from 'tcp-hono'
-import { INPUT_TOO_LONG, byteLength, format, irc, parse, tagsLength, truncate } from './protocol.ts'
+import {
+  INPUT_TOO_LONG,
+  byteLength,
+  format,
+  irc,
+  isClientTagKey,
+  parse,
+  tagsLength,
+  truncate,
+} from './protocol.ts'
 import { connect } from './test-utils.ts'
 
 const encoder = new TextEncoder()
@@ -46,6 +55,21 @@ describe('IRC', () => {
   it('Should drop NUL from a tag value and measure the tags', () => {
     expect(format({ tags: { a: 'b\0c' }, command: 'PING', params: [] })).toBe('@a=bc PING')
     expect(tagsLength({ a: 'b c', d: '' })).toBe('a=b\\sc;d'.length)
+  })
+
+  it('Should never write a tag key that would break the line', () => {
+    const tags = { 'a\rb': '1', 'c d': '2', 'e;f': '3', 'g=h': '4', 'i\0': '5', '@j': '6', '': '7' }
+    expect(format({ tags: { ...tags, ok: '8' }, command: 'PING', params: [] })).toBe('@ok=8 PING')
+    expect(format({ tags, command: 'PING', params: [] })).toBe('PING')
+  })
+
+  it('Should tell the client-only tag keys of the grammar of message-tags', () => {
+    for (const key of ['+a', '+typing', '+draft/reply', '+example.com/a-b', '+A-1']) {
+      expect(isClientTagKey(key), key).toBe(true)
+    }
+    for (const key of ['a', '+', '+a b', '+a\r', '+.a/b', '+a./b', '+a/', '+a/b/c', '+a=b', '+é']) {
+      expect(isClientTagKey(key), key).toBe(false)
+    }
   })
 
   it('Should format a message', () => {

@@ -538,10 +538,9 @@ describe('Registration rules', () => {
   it('Should not let the line terminator of a QUIT reason end the ERROR line', async () => {
     const { register } = setup()
     const alice = await register('alice')
+    // A raw CR is allowed nowhere in a line: the client is let go without the reason.
     await alice.send('QUIT :bye\rPRIVMSG #x :injected')
-    expect((await alice.all()).at(-1)).toMatch(
-      /^ERROR :Closing Link: \S+ \(Quit: bye PRIVMSG #x :injected\)$/
-    )
+    expect((await alice.all()).at(-1)).toMatch(/^ERROR :Closing Link: \S+ \(Quit:\)$/)
   })
 })
 

@@ -160,19 +160,44 @@ describe('message-tags', () => {
     expect(await exchange(alice, `@+a=${value}x PRIVMSG bob :hi`)).toEqual([
       ':irc.example 417 alice :Input line was too long',
     ])
-    // A raw CR in a value is escaped to two bytes, which would take the tags over the limit.
-    const raw = 'x'.repeat(4000) + '\r'.repeat(80)
-    expect(await exchange(alice, `@+a=${raw} PRIVMSG bob :hi`)).toEqual([
-      ':irc.example 417 alice :Input line was too long',
-    ])
   })
 
-  it('Should drop NUL from a tag value, which can not be escaped', async () => {
+  it('Should reject a line with a raw NUL or CR, and keep the client', async () => {
+    const { register } = setup()
+    const alice = await register('alice', ['batch', 'labeled-response'])
+    const bob = await register('bob', ['message-tags'])
+    const FORBIDDEN = 'Line contains a forbidden character (NUL or CR)'
+    expect(
+      await exchange(
+        alice,
+        '@+a=b\0c PRIVMSG bob :hi',
+        '@+a\r@account=root PRIVMSG bob :hi',
+        'PRIVMSG bob :one\rtwo',
+        '@label=x PRIVMSG bob :nul\0'
+      )
+    ).toEqual([
+      `:irc.example 400 alice PRIVMSG :${FORBIDDEN}`,
+      `:irc.example 400 alice PRIVMSG :${FORBIDDEN}`,
+      `:irc.example 400 alice PRIVMSG :${FORBIDDEN}`,
+      `@label=x :irc.example 400 alice PRIVMSG :${FORBIDDEN}`,
+    ])
+    await exchange(alice, 'PRIVMSG bob :ok')
+    expect(norm(await bob.waitFor(/ PRIVMSG /))).toBe('@msgid=ID :alice PRIVMSG bob ok')
+  })
+
+  it('Should relay only the client-only tags of the grammar of message-tags', async () => {
     const { register } = setup()
     const alice = await register('alice')
     const bob = await register('bob', ['message-tags'])
-    await exchange(alice, '@+a=b\0c PRIVMSG bob :hi')
-    expect(norm(await bob.waitFor(/ PRIVMSG /))).toBe('@msgid=ID;+a=bc :alice PRIVMSG bob hi')
+    // A key with an `@`, a space that the parser keeps, a dot without a vendor, or a `/` without a
+    // name is dropped, and the message is relayed with the others.
+    await exchange(
+      alice,
+      '@+typing=active;+example.com/x-y=1;+a@b=2;+.c=3;+d/=4;+e/f/g=5;+=6;-h=7;+ok PRIVMSG bob :hi'
+    )
+    expect(norm(await bob.waitFor(/ PRIVMSG /))).toBe(
+      '@msgid=ID;+typing=active;+example.com/x-y=1;+ok :alice PRIVMSG bob hi'
+    )
   })
 
   it('Should put the tags of the server before the client-only ones, and drop too many', () => {
