@@ -800,42 +800,89 @@ describe('Channel rules', () => {
 })
 
 describe('Flood control', () => {
-  it('Should disconnect a client that sends too much', async () => {
-    const { server, handler } = setup({ flood: { burst: 5, interval: 1000 } })
-    const register = async (nick: string) => {
-      const client = connect(handler)
-      // The registration takes 5 tokens, and the bucket is full again after it.
-      await client.send(
-        'CAP LS 302',
-        'CAP REQ :server-time',
-        'NICK ' + nick,
-        'USER x 0 * :X',
-        'CAP END'
-      )
-      await client.waitFor(/ 376 /)
-      return client
-    }
-    const alice = await register('alice')
-    const bob = await register('bob')
+  /** Connect a client that registers with NICK and USER only, which take 2 tokens. */
+  const registered = async (handler: ReturnType<typeof setup>['handler'], nick: string) => {
+    const client = connect(handler)
+    await client.send(`NICK ${nick}`, `USER ${nick} 0 * :${nick}`)
+    await client.waitFor(/ 376 /)
+    return client
+  }
+  const pongs = (client: ReturnType<typeof connect>) =>
+    client.lines.filter((line) => / PONG /.test(line)).map((line) => line.split(' ').at(-1))
+
+  it('Should delay a client that sends too much, and handle all of it in order', async () => {
+    const { server, handler } = setup({ flood: { burst: 3, interval: 20 } })
+    const alice = await registered(handler, 'alice')
+    const bob = await registered(handler, 'bob')
     await bob.send('JOIN #a')
+    await bob.waitFor(/ 366 /)
     await alice.send('JOIN #a')
     await bob.waitFor(/:alice\S+ JOIN /)
-    // JOIN took 2 tokens, so 3 PRIVMSG are fine and the fourth one is too many.
-    await alice.send('PRIVMSG #a :1', 'PRIVMSG #a :2', 'PRIVMSG #a :3', 'PRIVMSG #a :4')
-    expect((await alice.all()).at(-1)).toMatch(/^ERROR :Closing Link: \S+ \(Excess Flood\)$/)
-    expect(await bob.waitFor(/ QUIT /)).toMatch(/ :alice!\S+ QUIT :Excess Flood$/)
-    expect(bob.lines.filter((line) => / PRIVMSG /.test(line))).toHaveLength(3)
-    await alice.closed
-    expect(server.clients.size).toBe(1)
+    await sleep(60)
+    const start = Date.now()
+    await alice.send(...Array.from({ length: 10 }, (_, i) => `PRIVMSG #a :${i}`))
+    await bob.waitFor(/ PRIVMSG #a 9$/)
+    // 3 at once, and then one every 20 ms.
+    expect(Date.now() - start).toBeGreaterThanOrEqual(120)
+    const received = bob.lines.filter((line) => / PRIVMSG /.test(line))
+    expect(received.map((line) => line.split(' ').at(-1))).toEqual(
+      Array.from({ length: 10 }, (_, i) => String(i))
+    )
+    expect(alice.lines.some((line) => line.startsWith('ERROR'))).toBe(false)
+    expect(server.clients.size).toBe(2)
   })
 
-  it('Should let a client send again after a while', async () => {
-    const { register } = setup({ flood: { burst: 2, interval: 50 } })
-    const alice = await register('alice')
-    for (let i = 0; i < 5; i++) {
-      await sleep(60)
-      expect(await exchange(alice)).toEqual([])
+  it('Should not delay the others', async () => {
+    const { handler } = setup({ flood: { burst: 1, interval: 100 } })
+    const alice = await registered(handler, 'alice')
+    const bob = await registered(handler, 'bob')
+    await sleep(110)
+    await alice.send(...Array.from({ length: 6 }, (_, i) => `PING a${i}`))
+    await alice.waitFor(/ PONG \S+ a0$/)
+    const start = Date.now()
+    await bob.send('PING b')
+    await bob.waitFor(/ PONG \S+ b$/)
+    expect(Date.now() - start).toBeLessThan(50)
+    // alice is still waiting for hers.
+    expect(pongs(alice).length).toBeLessThan(6)
+    await alice.waitFor(/ PONG \S+ a5$/)
+    expect(pongs(alice)).toEqual(['a0', 'a1', 'a2', 'a3', 'a4', 'a5'])
+  })
+
+  it('Should stop waiting when the connection is closed', async () => {
+    const { server, handler } = setup({ pingInterval: 100, flood: { burst: 1, interval: 60_000 } })
+    const client = connect(handler)
+    // Before the registration, each line takes one token, so the second one waits a minute.
+    await client.send('PING a', 'PING b', 'PING c')
+    await client.waitFor(/ PONG \S+ a$/)
+    await sleep(120)
+    const start = Date.now()
+    // The registration timeout closes the connection while its command waits.
+    server.tick()
+    await client.closed
+    expect(Date.now() - start).toBeLessThan(200)
+    expect(await client.all()).toEqual([
+      ':irc.hono.local PONG irc.hono.local a',
+      expect.stringMatching(/\(Registration timeout\)$/),
+    ])
+    expect(server.clients.size).toBe(0)
+  })
+
+  it('Should not time out a client whose PONG waits behind its own commands', async () => {
+    const { server, handler } = setup({ pingInterval: 20, flood: { burst: 1, interval: 100 } })
+    const alice = await registered(handler, 'alice')
+    await sleep(110)
+    // Each command waits 100 ms, which is longer than the ping timeout of 40 ms.
+    await alice.send('PING a', 'PING b', 'PING c', 'PONG :irc.hono.local')
+    const ticking = setInterval(server.tick, 5)
+    try {
+      await alice.waitFor(/ PONG \S+ c$/)
+    } finally {
+      clearInterval(ticking)
     }
+    expect(pongs(alice)).toEqual(['a', 'b', 'c'])
+    expect(alice.lines.some((line) => line.startsWith('ERROR'))).toBe(false)
+    expect(server.clients.size).toBe(1)
   })
 
   it('Should be on by default', async () => {
@@ -843,8 +890,15 @@ describe('Flood control', () => {
     const client = connect(server.connect)
     await client.send('NICK alice', 'USER alice 0 * :Alice')
     await client.waitFor(/ 376 /)
+    // The bucket is full after the registration: 10 at once, and the 11th waits for 2 seconds.
     await client.send(...Array.from({ length: 11 }, (_, i) => `PING ${i}`))
-    expect((await client.all()).at(-1)).toMatch(/\(Excess Flood\)$/)
+    await client.waitFor(/ PONG \S+ 9$/)
+    await sleep(100)
+    expect(pongs(client)).toHaveLength(10)
+    for (const { connection } of server.clients.values()) {
+      connection.close()
+    }
+    await client.closed
   })
 })
 

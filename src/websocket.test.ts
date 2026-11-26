@@ -221,6 +221,23 @@ describe('fromWebSocket()', () => {
     expect(await drain(fromWebSocket(ws).readable)).toEqual({ text: '', done: true })
   })
 
+  it('Should let the server reply ERR_INPUTTOOLONG to a line that is too long', async () => {
+    const server = createServer({ name: 'irc.example', flood: false })
+    const ws = new FakeWebSocket()
+    void server.connect(fromWebSocket(ws, { protocol: TEXT }), {})
+    // Longer than a line may be, but within `maxLength`, so the server decides.
+    ws.receive('PING :' + 'a'.repeat(600))
+    ws.receive('@+a=' + 'x'.repeat(4091) + ' PING :' + 'b'.repeat(503))
+    await expect.poll(() => ws.sent.length).toBe(2)
+    expect(ws.sent[0]).toBe(':irc.example 417 * :Input line was too long')
+    // The reply is cut to fit in 510 bytes, as any line from the server.
+    expect(ws.sent[1]).toBe(`:irc.example PONG irc.example ${'b'.repeat(479)}`)
+    expect(ws.closed).toBeUndefined()
+    // Past `maxLength`, the connection is closed, as a line over TCP that does not end.
+    ws.receive('PING :' + 'c'.repeat(70_000))
+    expect(ws.closed).toEqual({ code: 1009, reason: 'Message too long' })
+  })
+
   it('Should serve an IRC client', async () => {
     const server = createServer({ name: 'irc.example' })
     const ws = new FakeWebSocket()

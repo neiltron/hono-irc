@@ -35,7 +35,7 @@ app.on('TCP', '/PRIVMSG/:targets/:text', (c) => { ... })
 | [`src/numerics.ts`](./src/numerics.ts)                           | The names of the numeric replies                                          |
 | [`src/state.ts`](./src/state.ts)                                 | `Client`, `Channel`, and `Server`: the state, the registries, and helpers |
 | [`src/server.ts`](./src/server.ts)                               | `createServer()`. A Hono app that does not depend on a runtime            |
-| [`src/flood.ts`](./src/flood.ts)                                 | The flood control: a token bucket for each connection                     |
+| [`src/flood.ts`](./src/flood.ts)                                 | The flood control: a token bucket and fake lag for each connection        |
 | [`src/commands/registration.ts`](./src/commands/registration.ts) | `CAP`, `NICK`, `USER`, `PASS`, `PING`, `PONG`, `QUIT`                     |
 | [`src/commands/channels.ts`](./src/commands/channels.ts)         | `JOIN`, `PART`, `TOPIC`, `NAMES`, `LIST`, `KICK`                          |
 | [`src/commands/messages.ts`](./src/commands/messages.ts)         | `PRIVMSG`, `NOTICE`, `AWAY`                                               |
@@ -61,7 +61,7 @@ The Worker serves the [IRCv3 WebSocket transport](https://ircv3.net/specs/extens
 
 - `pnpm dev` serves it at `ws://localhost:5173/`. Deployed, it is `wss://hono-irc.<subdomain>.workers.dev/`, which has TLS on any plan.
 - Each WebSocket message is one IRC line without CRLF. The subprotocols are `text.ircv3.net` (text messages, UTF-8; the bytes that are not UTF-8 become U+FFFD) and `binary.ircv3.net` (binary messages, any bytes). The first one that the client offers wins. A client that offers neither is accepted without a subprotocol, and gets the type of its own first message, or text before that.
-- A message with a line break inside, or longer than 8701 bytes, closes the connection. So does a client that sends faster than the server reads, or does not read what is sent to it, beyond 1 MiB, like `maxBufferedBytes` of `tcp-hono` for TCP.
+- A line has the same limits as over TCP: a message longer than 4096 bytes of tags and 510 bytes of the rest gets `ERR_INPUTTOOLONG`, and the connection stays open. A message with a line break inside, or longer than 64 KiB, closes the connection. So does a client that sends faster than the server reads, or does not read what is sent to it, beyond 1 MiB, like `maxBufferedBytes` of `tcp-hono` for TCP.
 - Any `Origin` is allowed. The server reads no cookies and no HTTP authentication, so a page on another origin can do nothing that it could not do by connecting directly. `src/index.ts` explains it.
 - The object accepts the WebSocket with `accept()`, not with the hibernation API, because the state is in memory and a hibernated object would lose it.
 
@@ -92,7 +92,7 @@ The dependency is pinned to a commit, and pnpm builds it on install. To update i
 - The address of the client is passed to the server, from `CF-Connecting-IP` for a WebSocket and from the Worker for TCP (see below). It is not shown to the other users, who see a random host.
 - A client that does not answer a `PING` is disconnected, and so is one that has not registered in time after it connected.
 - Limits, set with the options of `createServer()`:
-  - `flood`: a token bucket for each connection, by default 10 commands at once and one more every 2 seconds, with `NICK`, `JOIN`, and `PART` taking more. A client that runs out is disconnected with "Excess Flood". A client should pace itself, as irssi and WeeChat do. `false` turns it off.
+  - `flood`: a token bucket for each connection, by default 10 commands at once and one more every 2 seconds, with `NICK`, `JOIN`, and `PART` taking more. A client that runs out is not disconnected: its commands wait until the tokens are back (fake lag), so a burst is handled in full and in order, only slower. The others are not slowed down. `false` turns it off.
   - `maxConnections` (1000), `maxConnectionsPerIp` (10, when the runtime knows the address), and `maxChannels` (1000).
 
 ## What is not implemented

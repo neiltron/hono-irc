@@ -65,6 +65,8 @@ export const parse = (line: string): IRCMessage | undefined => {
 export const MAX_LINE_LENGTH = 512
 /** The max length of the tags of a line from a client, in bytes, with `@` and the space after. */
 export const MAX_TAGS_LENGTH = 4096
+/** The max length of a line that is skipped as too long, before the connection is closed. */
+export const MAX_SKIP_LENGTH = 65536
 
 // The bytes of a character in UTF-8, and whether it is a surrogate pair of two code units.
 // A lone surrogate is encoded as U+FFFD, which is 3 bytes, like `TextEncoder` does.
@@ -179,7 +181,7 @@ export type IRCOptions = {
    * A line that is too long is skipped up to its line terminator. The connection is closed once
    * more than this many bytes of one line have been skipped, so the client can not make the
    * server read forever without a message.
-   * @default 65536
+   * @default 65536 (`MAX_SKIP_LENGTH`)
    */
   maxSkipLength?: number
 }
@@ -193,7 +195,7 @@ const TOO_LONG = Symbol('too long')
 const splitLines = (options: IRCOptions) => {
   const maxLength = options.maxLength ?? MAX_LINE_LENGTH
   const maxTagsLength = options.maxTagsLength ?? MAX_TAGS_LENGTH
-  const maxSkipLength = options.maxSkipLength ?? 65536
+  const maxSkipLength = options.maxSkipLength ?? MAX_SKIP_LENGTH
   // A line that has not ended can not be longer than this.
   const limit = maxLength + maxTagsLength
   // The start of the current line, from the previous chunks.

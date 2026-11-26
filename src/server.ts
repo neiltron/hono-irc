@@ -183,7 +183,9 @@ export const createServer = (config: ServerOptions = {}) => {
   const tick = () => {
     const now = Date.now()
     for (const client of server.clients.values()) {
-      const silent = now - client.active
+      // A client whose command waits for the flood control has sent something, which is handled
+      // later, so it is not silent. A wait ends after a few tokens' time.
+      const silent = client.delayed ? 0 : now - client.active
       // The registration has to be done in time from the connection, whatever the client sends.
       if (
         client.registered

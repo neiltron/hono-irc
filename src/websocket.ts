@@ -1,4 +1,5 @@
 import type { Socket } from 'tcp-hono'
+import { MAX_SKIP_LENGTH } from './protocol.ts'
 
 /**
  * The IRCv3 WebSocket transport: https://ircv3.net/specs/extensions/websocket
@@ -49,7 +50,12 @@ export type WebSocketOptions = {
   protocol?: Subprotocol
   /**
    * The max length of a message from the client in bytes. A longer one closes the connection.
-   * @default 8701 (8191 for the tags and 510 for the rest, which is 512 without CRLF)
+   *
+   * It is not the limit of an IRC line, which the server checks as it does for TCP: a message
+   * longer than a line may be, 4096 bytes of tags and 510 of the rest, is passed on, and the
+   * server replies `ERR_INPUTTOOLONG` and keeps the connection. This only bounds the memory, as
+   * `maxSkipLength` of `irc()` does for a line over TCP that does not end.
+   * @default 65536 (`MAX_SKIP_LENGTH`)
    */
   maxLength?: number
   /**
@@ -81,7 +87,7 @@ const decoder = new TextDecoder()
  * `bufferedAmount` stays at 0 does not report its queue, and only that runtime bounds it.
  */
 export const fromWebSocket = (ws: WebSocketLike, options: WebSocketOptions = {}): Socket => {
-  const maxLength = options.maxLength ?? 8701
+  const maxLength = options.maxLength ?? MAX_SKIP_LENGTH
   const maxBufferedBytes = options.maxBufferedBytes ?? 1024 * 1024
   // `undefined` until the first message from a client that negotiated no subprotocol.
   let binary = options.protocol === undefined ? undefined : options.protocol === BINARY

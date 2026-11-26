@@ -9,7 +9,8 @@ import IRC from 'irc-framework'
 
 const host = process.argv[2] ?? '127.0.0.1'
 const port = Number(process.argv[3] ?? process.env.PORT ?? 6667)
-// A command may wait in the queue of `throttle()` for a while.
+// A client that sends a burst is slowed down by the flood control of the server, so a reply may
+// take a few seconds.
 const TIMEOUT = 15_000
 
 const log = (who, ...args) => console.log(`[${who}]`, ...args)
@@ -21,50 +22,6 @@ const fail = (error) => {
 process.on('unhandledRejection', fail)
 // The whole run must not take long, whatever hangs.
 setTimeout(() => fail(new Error('the run took too long')), 120_000).unref()
-
-/**
- * The server disconnects a client that floods it, so the clients pace themselves, as irssi and
- * WeeChat do, with the default budget of the server: 10 tokens, one back every 2 seconds, and
- * NICK, JOIN, and PART take more. One token is kept spare. irc-framework does not do this itself.
- */
-const throttle = (bot) => {
-  const write = bot.connection.write.bind(bot.connection)
-  const costs = { NICK: 3, JOIN: 2, PART: 2 }
-  const queue = []
-  let tokens = 10
-  let at = Date.now()
-  let registered = false
-  let timer
-  // The server fills the bucket again once the client has registered.
-  bot.on('registered', () => {
-    registered = true
-    tokens = 10
-    at = Date.now()
-  })
-  const pump = () => {
-    timer = undefined
-    while (queue.length) {
-      tokens = Math.min(10, tokens + (Date.now() - at) / 2000)
-      at = Date.now()
-      const [data, callback] = queue[0]
-      const cost = registered ? (costs[data.split(' ')[0].toUpperCase()] ?? 1) : 1
-      if (tokens - cost < 1) {
-        timer = setTimeout(pump, (cost + 1 - tokens) * 2000)
-        return
-      }
-      tokens -= cost
-      queue.shift()
-      write(data, callback)
-    }
-  }
-  bot.connection.write = (data, callback) => {
-    queue.push([data, callback])
-    if (!timer) {
-      pump()
-    }
-    return true
-  }
-}
 
 /** Wait for an event of the client that matches, or fail after a while. */
 const once = (bot, event, match = () => true) =>
@@ -92,7 +49,6 @@ const line = (bot, pattern) =>
 const connect = (nick, caps = ['echo-message']) =>
   new Promise((resolve, reject) => {
     const bot = new IRC.Client()
-    throttle(bot)
     for (const cap of caps) {
       bot.requestCap(cap)
     }
@@ -266,14 +222,34 @@ await step('a connection that is dropped', async () => {
   assert.equal((await quit).nick, 'carol')
 })
 
-await step('a client that floods is disconnected', async () => {
-  const mallory = await connect('mallory')
-  const error = line(mallory, /^ERROR /)
-  // Past the throttle, straight to the socket.
-  for (let i = 0; i < 12; i++) {
-    mallory.connection.transport.writeLine(`PRIVMSG alice :${i}`)
+await step('a burst is delayed, and handled in full and in order', async () => {
+  const dave = await connect('dave')
+  const count = 14
+  const received = []
+  const done = new Promise((resolve) => {
+    alice.on('privmsg', (e) => {
+      if (e.nick === 'dave') {
+        received.push(e.message)
+        if (received.length === count) {
+          resolve()
+        }
+      }
+    })
+  })
+  const start = Date.now()
+  // 10 at once, and then one every 2 seconds.
+  for (let i = 0; i < count; i++) {
+    dave.say('alice', `burst ${i}`)
   }
-  assert.match(await error, /\(Excess Flood\)$/)
+  await done
+  const elapsed = Date.now() - start
+  log('dave', `${count} messages in ${elapsed} ms`)
+  assert.deepEqual(
+    received,
+    Array.from({ length: count }, (_, i) => `burst ${i}`)
+  )
+  assert.ok(elapsed >= 5000, `the burst was not delayed: ${elapsed} ms`)
+  assert.ok(dave.connection.connected, 'dave is still connected')
 })
 
 alice.quit()

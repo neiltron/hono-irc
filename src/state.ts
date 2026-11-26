@@ -61,10 +61,10 @@ export type ServerOptions = {
 
 /**
  * A token bucket for each connection. A command takes tokens, and the tokens come back one at
- * a time. A client that runs out is disconnected with "Excess Flood".
+ * a time. The command of a client that runs out waits until its tokens are back.
  */
 export type FloodOptions = {
-  /** The number of tokens of a full bucket, which is how many commands can be sent at once. */
+  /** The number of tokens of a full bucket, which is how many commands are handled at once. */
   burst?: number
   /** The milliseconds that it takes to get one token back. */
   interval?: number
@@ -150,6 +150,8 @@ export class Client {
   /** When the client sent a PRIVMSG or a NOTICE, which is what WHOIS shows as the idle time. */
   idle = Date.now()
   pinged = false
+  /** Whether a command of the client waits for the flood control. */
+  delayed = false
   /** The version of `CAP LS`, e.g. 302, or 0 if the client has not sent one with a version. */
   capVersion = 0
   /**
