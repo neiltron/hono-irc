@@ -1,4 +1,3 @@
-import { tcp } from 'tcp-hono'
 import { describe, expect, it } from 'vite-plus/test'
 import { createServer } from './server.ts'
 import type { ServerOptions } from './server.ts'
@@ -6,7 +5,7 @@ import { connect } from './test-utils.ts'
 
 const setup = (config?: ServerOptions) => {
   const server = createServer(config)
-  const handler = tcp.socket(server.app, server.options)
+  const handler = server.connect
   /** Connect a client and complete the registration. */
   const register = async (nick: string, capabilities: string[] = []) => {
     const client = connect(handler)
@@ -231,5 +230,111 @@ describe('Disconnection', () => {
     expect(await bob.all()).toContainEqual(expect.stringMatching(/\(Ping timeout\)$/))
     expect(await alice.waitFor(/ QUIT /)).toMatch(/^:bob!\S+ QUIT :Ping timeout$/)
     expect(server.clients.size).toBe(1)
+  })
+})
+
+describe('Outbound messages', () => {
+  it('Should send the replies of each channel after its JOIN', async () => {
+    const { register } = setup()
+    const alice = await register('alice')
+    const start = alice.lines.length
+    await alice.send('JOIN #a,#b')
+    await alice.waitFor(/ 366 alice #b /)
+    expect(alice.lines.slice(start).map((line) => line.replace(/^:\S+ /, ''))).toEqual([
+      'JOIN #a',
+      '353 alice = #a @alice',
+      '366 alice #a :End of /NAMES list',
+      'JOIN #b',
+      '353 alice = #b @alice',
+      '366 alice #b :End of /NAMES list',
+    ])
+  })
+
+  it('Should send a tag only to a client that has its capability', async () => {
+    const { register } = setup()
+    const alice = await register('alice', ['server-time', 'echo-message'])
+    const bob = await register('bob')
+    await alice.send('JOIN #hono')
+    await bob.send('JOIN #hono')
+    await bob.waitFor(/ 366 /)
+    expect(await alice.waitFor(/:bob\S+ JOIN /)).toMatch(/^@time=\S+ :bob!\S+ JOIN #hono$/)
+    // The messages from alice, who has server-time, are relayed to bob without the tag.
+    await alice.send('PRIVMSG #hono :Hello', 'PRIVMSG bob :psst')
+    expect(await alice.waitFor(/ PRIVMSG #hono /)).toMatch(/^@time=\S+ :alice!\S+ PRIVMSG/)
+    expect(await bob.waitFor(/ PRIVMSG #hono /)).toMatch(/^:alice!\S+ PRIVMSG #hono Hello$/)
+    expect(await bob.waitFor(/ PRIVMSG bob /)).toMatch(/^:alice!\S+ PRIVMSG bob psst$/)
+    expect(bob.lines.filter((line) => line.startsWith('@'))).toEqual([])
+  })
+})
+
+describe('Registries', () => {
+  it('Should list the values of the capabilities with CAP LS 302 only', async () => {
+    const { server, handler } = setup()
+    server.capabilities.set('sasl', 'PLAIN,EXTERNAL')
+    const client = connect(handler)
+    await client.send('CAP LS')
+    const names = await client.waitFor(/ CAP /)
+    expect(names).toMatch(/ CAP \* LS :.*\bsasl\b/)
+    expect(names).not.toContain('sasl=')
+    await client.send('CAP LS 302')
+    expect(await client.waitFor(/ CAP /)).toMatch(/ CAP \* LS :.* sasl=PLAIN,EXTERNAL /)
+    await client.send('CAP REQ :sasl', 'CAP REQ :sasl=PLAIN')
+    expect(await client.waitFor(/ CAP /)).toContain('CAP * ACK sasl')
+    expect(await client.waitFor(/ CAP /)).toContain('CAP * NAK sasl=PLAIN')
+  })
+
+  it('Should split a long CAP LS 302 reply into lines', async () => {
+    const { server, handler } = setup()
+    const fakes = Array.from({ length: 40 }, (_, i) => `draft/fake-capability-${i}`)
+    for (const name of fakes) {
+      server.capabilities.set(name, 'some,values')
+    }
+    const client = connect(handler)
+    await client.send('CAP LS 302', 'PING :done')
+    await client.waitFor(/ PONG /)
+    const lines = client.lines.filter((line) => / CAP /.test(line))
+    expect(lines.length).toBeGreaterThan(1)
+    lines.forEach((line, i) => {
+      expect(line.length).toBeLessThanOrEqual(512)
+      if (i < lines.length - 1) {
+        expect(line).toMatch(/^:\S+ CAP \* LS \* :/)
+      } else {
+        expect(line).toMatch(/^:\S+ CAP \* LS :/)
+      }
+    })
+    const tokens = lines.flatMap((line) => line.slice(line.indexOf(' :') + 2).split(' '))
+    expect(tokens).toEqual(expect.arrayContaining(fakes.map((name) => `${name}=some,values`)))
+    expect(tokens).toContain('server-time')
+    expect(tokens.length).toBe(server.capabilities.size)
+  })
+
+  it('Should split the ISUPPORT tokens into lines of 13', async () => {
+    const { server, register } = setup()
+    for (let i = 0; i < 10; i++) {
+      server.isupport.set(`FAKE${i}`, i % 2 ? true : String(i))
+    }
+    const client = await register('alice')
+    const lines = client.lines.filter((line) => / 005 /.test(line))
+    expect(lines).toHaveLength(2)
+    const tokens = lines.map((line) => line.split(' ').slice(3, -5))
+    expect(tokens.map((list) => list.length)).toEqual([13, 6])
+    expect(lines[0]).toMatch(/ 005 alice CASEMAPPING=ascii .* :are supported by this server$/)
+    expect(lines[1]).toMatch(/ 005 alice FAKE4=4 FAKE5 .* FAKE9 :are supported by this server$/)
+  })
+})
+
+describe('Connection', () => {
+  it('Should give the information of the connection to the client', async () => {
+    const { server } = setup()
+    const alice = connect((socket) => server.connect(socket, { ip: '192.0.2.1', secure: true }))
+    const bob = connect(server.connect)
+    await alice.send('NICK alice', 'USER alice 0 * :Alice')
+    await bob.send('NICK bob', 'USER bob 0 * :Bob')
+    // The host is not the address.
+    expect(await alice.waitFor(/ 001 /)).toMatch(/alice!~alice@\w+\.user$/)
+    await bob.waitFor(/ 001 /)
+    const [first, second] = server.clients.values()
+    expect([first.nick, first.ip, first.secure]).toEqual(['alice', '192.0.2.1', true])
+    expect([second.nick, second.ip, second.secure]).toEqual(['bob', undefined, false])
   })
 })

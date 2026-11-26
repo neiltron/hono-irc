@@ -1,5 +1,4 @@
 import { DurableObject } from 'cloudflare:workers'
-import { tcp } from 'tcp-hono'
 import { createServer } from './server.ts'
 
 type Env = {
@@ -15,15 +14,15 @@ type Env = {
  */
 export class Network extends DurableObject<Env> {
   #server = createServer()
-  #handler = tcp.socket(this.#server.app, this.#server.options)
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
     setInterval(this.#server.tick, 30_000)
   }
 
+  // The socket is piped from the Worker, so the object does not know the address of the client.
   connect(socket: Socket): Promise<void> {
-    return this.#handler(socket, this.env, this.ctx)
+    return this.#server.connect(socket)
   }
 }
 

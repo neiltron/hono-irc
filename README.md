@@ -29,15 +29,25 @@ Cloudflare Workers accept inbound TCP connections with the [`connect()` handler]
 app.on('TCP', '/PRIVMSG/:targets/:text', (c) => { ... })
 ```
 
-| File                                   | Role                                                                |
-| -------------------------------------- | ------------------------------------------------------------------- |
-| [`src/protocol.ts`](./src/protocol.ts) | The IRC protocol for `tcp-hono`: framing, `parse()`, and `format()` |
-| [`src/server.ts`](./src/server.ts)     | The server. A Hono app that does not depend on a runtime            |
-| [`src/index.ts`](./src/index.ts)       | Cloudflare Workers: the Worker and the Durable Object               |
-| [`src/node.ts`](./src/node.ts)         | Node.js                                                             |
+| File                                                             | Role                                                                      |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| [`src/protocol.ts`](./src/protocol.ts)                           | The IRC protocol for `tcp-hono`: framing, `parse()`, and `format()`       |
+| [`src/numerics.ts`](./src/numerics.ts)                           | The names of the numeric replies                                          |
+| [`src/state.ts`](./src/state.ts)                                 | `Client`, `Channel`, and `Server`: the state, the registries, and helpers |
+| [`src/server.ts`](./src/server.ts)                               | `createServer()`. A Hono app that does not depend on a runtime            |
+| [`src/commands/registration.ts`](./src/commands/registration.ts) | `CAP`, `NICK`, `USER`, `PASS`, `PING`, `PONG`, `QUIT`                     |
+| [`src/commands/channels.ts`](./src/commands/channels.ts)         | `JOIN`, `PART`, `TOPIC`, `NAMES`, `LIST`, `KICK`                          |
+| [`src/commands/messages.ts`](./src/commands/messages.ts)         | `PRIVMSG`, `NOTICE`, `AWAY`                                               |
+| [`src/commands/modes.ts`](./src/commands/modes.ts)               | `MODE`                                                                    |
+| [`src/commands/queries.ts`](./src/commands/queries.ts)           | `WHO`, `WHOIS`, `MOTD`, `LUSERS`                                          |
+| [`src/index.ts`](./src/index.ts)                                 | Cloudflare Workers: the Worker and the Durable Object                     |
+| [`src/node.ts`](./src/node.ts)                                   | Node.js                                                                   |
 
-- The replies to the sender are the response of the handler: `c.render(['332', channel, topic])`. The nickname of the client is inserted into a numeric reply.
+- Each file in `src/commands` is a Hono app, and `src/server.ts` mounts them with `app.route()`.
+- A message to a client is sent with `client.send(message)` or `channel.send(message)`. While a client's own command is handled, the messages to it, and the replies of `c.render(['332', channel, topic])`, are collected in order and written as the response. The nickname of the client is inserted into a numeric reply.
 - The messages to the others are pushed to their connections with `connection.send()`.
+- A message tag is sent only to a client that has the capability of the tag, such as `server-time` for `time`. The capabilities, the `RPL_ISUPPORT` tokens, and the tags are registered in `Server`.
+- A runtime hands over a socket with `connect(socket, info)` of the server.
 - On Cloudflare Workers, the `connect()` handler of the Worker pipes the socket to the `connect()` handler of one Durable Object. The object holds all the connections, which is why a message from a client can be written to the sockets of the others.
 - The users and the channels are in memory. An IRC channel disappears when the last member leaves, so nothing needs to be stored as long as the Durable Object stays in memory while it has a connection. A deploy or a restart of the object disconnects everyone, and the clients reconnect.
 
@@ -60,7 +70,7 @@ The dependency is pinned to a commit, and pnpm builds it on install. To update i
 
 - TLS. According to the Cloudflare documentation, Spectrum terminates TLS for a Worker only with the Enterprise add-on, and `startTls()` is not supported for an inbound socket.
 - Accounts (`SASL`), bans, invites, keys, operators, and server-to-server links.
-- The address of the client. The Durable Object does not see it, so every user gets a random host.
+- The address of the client. The Durable Object does not see it. Node.js passes it to the server, but it is not shown, so every user gets a random host.
 - The other IRCv3 extensions, such as `message-tags`, `batch`, `labeled-response`, `chathistory`, and the WebSocket transport.
 
 ## Deploying
