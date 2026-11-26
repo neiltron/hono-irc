@@ -3,12 +3,12 @@
 An IRC server on Cloudflare Workers and Durable Objects, built with [Hono](https://hono.dev) and [tcp-hono](https://github.com/yusukebe/tcp-hono). It also runs on Node.js.
 
 > [!WARNING]
-> This is an experiment. It has no TLS over TCP and no authentication, and only basic flood protection. Do not expose it as is.
+> This is an experiment. It has no TLS over TCP, so a password sent over TCP (`AUTHENTICATE PLAIN`, `REGISTER`) is in the clear, and only basic flood protection. Do not expose it as is.
 
 ```sh
 pnpm install
 pnpm dev        # Cloudflare Workers, with `cf dev`
-pnpm dev:node   # Node.js, on the port of `PORT` or 6667
+pnpm dev:node   # Node.js, on the port of `PORT` or 6667, with the accounts in the SQLite file of `DATABASE`, or in memory
 ```
 
 Connect with any IRC client to `localhost:6667` without TLS, or with a web client to `ws://localhost:5173/` (Cloudflare Workers only, see [WebSocket](#websocket)).
@@ -36,6 +36,8 @@ app.on('TCP', '/PRIVMSG/:targets/:text', (c) => { ... })
 | [`src/state.ts`](./src/state.ts)                                 | `Client`, `Channel`, and `Server`: the state, the registries, and helpers |
 | [`src/server.ts`](./src/server.ts)                               | `createServer()`. A Hono app that does not depend on a runtime            |
 | [`src/flood.ts`](./src/flood.ts)                                 | The flood control: a token bucket and fake lag for each connection        |
+| [`src/store.ts`](./src/store.ts)                                 | The database: a synchronous SQL interface on SQLite, and the migrations   |
+| [`src/accounts.ts`](./src/accounts.ts)                           | The accounts: the hashes of the passwords, the storage, and the limits    |
 | [`src/cloak.ts`](./src/cloak.ts)                                 | The cloaks: the hosts shown in place of the addresses, with HMAC-SHA-256  |
 | [`src/masks.ts`](./src/masks.ts)                                 | The masks of bans and exceptions: `nick!user@host` with `*` and `?`       |
 | [`src/commands/registration.ts`](./src/commands/registration.ts) | `CAP`, `NICK`, `USER`, `PASS`, `PING`, `PONG`, `QUIT`                     |
@@ -46,6 +48,8 @@ app.on('TCP', '/PRIVMSG/:targets/:text', (c) => { ... })
 | [`src/commands/queries.ts`](./src/commands/queries.ts)           | `WHO` (with WHOX), `WHOIS`, `ISON`, `USERHOST`, `MOTD`, `LUSERS`          |
 | [`src/commands/monitor.ts`](./src/commands/monitor.ts)           | `MONITOR`                                                                 |
 | [`src/commands/setname.ts`](./src/commands/setname.ts)           | `SETNAME`                                                                 |
+| [`src/commands/sasl.ts`](./src/commands/sasl.ts)                 | `AUTHENTICATE`: SASL and its mechanisms, of which `PLAIN`                 |
+| [`src/commands/account.ts`](./src/commands/account.ts)           | `REGISTER` and `VERIFY`: account registration                             |
 | [`src/websocket.ts`](./src/websocket.ts)                         | The IRCv3 WebSocket transport: a WebSocket as a socket of `tcp-hono`      |
 | [`src/index.ts`](./src/index.ts)                                 | Cloudflare Workers: the Worker and the Durable Object                     |
 | [`src/node.ts`](./src/node.ts)                                   | Node.js                                                                   |
@@ -57,10 +61,12 @@ app.on('TCP', '/PRIVMSG/:targets/:text', (c) => { ... })
 - A message tag is sent only to a client that has the capability of the tag, such as `server-time` for `time`, and a client-only tag (`+name`) only to a client that has `message-tags`. The capabilities, the `RPL_ISUPPORT` tokens, and the tags are registered in `Server`, and `client.format()` filters them.
 - The `label` of `labeled-response` is added by the same middleware, to the messages of the outbox, which are exactly what the command caused: one line gets the label, none gets `ACK`, and more are put in a `labeled-response` batch. So every command is covered, including the errors, `421`, `417`, and the `ERROR` of `QUIT`. A message to the client that its command did not answer, such as its own private message to itself, is sent with `client.send(message, false)` and stays out of the response.
 - `client.sendBatch()` sends messages as a batch to a client that has `batch`, and as single lines to the others. The standard replies are lines such as `fail('BATCH', 'TIMEOUT', ref, 'description')`, rendered like numerics.
+- A handler is synchronous, so the outbox holds exactly what its command caused. The slow, asynchronous work of a command, such as hashing a password with WebCrypto, is a prepare step in `server.prepare`, which the middleware runs before it opens the outbox, as the flood control waits there, and hands to the handler as `c.var.prepared`. The handler reads the state again and decides.
 - A runtime hands over a socket with `connect(socket, info)` of the server.
 - On Cloudflare Workers, the `connect()` handler of the Worker pipes the socket to the `connect()` handler of one Durable Object. The object holds all the connections, which is why a message from a client can be written to the sockets of the others.
 - A WebSocket goes to the same object: the `fetch()` handler of the Worker forwards the upgrade request to it, and `fromWebSocket()` of `src/websocket.ts` turns the WebSocket into a socket for the same `connect()` of the server. A WebSocket client and a TCP client are in the same channels.
 - The users and the channels are in memory. An IRC channel disappears when the last member leaves, so nothing needs to be stored as long as the Durable Object stays in memory while it has a connection. A deploy or a restart of the object disconnects everyone, and the clients reconnect.
+- The accounts are stored, in the SQLite database of the Durable Object, or of `node:sqlite` on Node.js (see [Accounts](#accounts)).
 
 ## WebSocket
 
@@ -88,6 +94,7 @@ The dependency is pinned to a commit, and pnpm builds it on install. To update i
 ## What is implemented
 
 - Registration: `CAP`, `NICK`, `USER`, `PASS` (not checked), `PING`, `PONG`, `QUIT`
+- Accounts: `AUTHENTICATE` (SASL `PLAIN`), `REGISTER`, `VERIFY`, and the nicknames that the accounts reserve (see [Accounts](#accounts))
 - Channels: `JOIN` (with keys), `PART`, `TOPIC`, `NAMES`, `LIST`, `KICK`, `INVITE`, and `MODE` with `CHANMODES=beI,k,l,imnst` and `PREFIX=(ov)@+`:
   - `+b` bans, `+e` ban exceptions, and `+I` invite exceptions: masks `nick!user@host` with `*` and `?`, in ASCII case, kept in their full form (`bob` is `bob!*@*`, `*@host` is `*!*@host`). A backslash escapes `*`, `?`, and `\`. `MODE #channel b` lists the bans to anyone who can see the channel, and `e` and `I` only to its operators.
   - A banned client can not join (`ERR_BANNEDFROMCHAN`), send to the channel from inside or outside (`PRIVMSG`, `NOTICE`, `TAGMSG`, or a multiline message), or change its nickname while it is in the channel (`ERR_BANNICKCHANGE`, 435), unless it is an operator or has voice there. An exception (`+e`) cancels a ban.
@@ -98,16 +105,16 @@ The dependency is pinned to a commit, and pnpm builds it on install. To update i
 - Users: `MODE` with `+i` (an invisible user is left out of `NAMES` and `WHO` of a channel for those outside it) and `+B` (bot mode)
 - Messages: `PRIVMSG`, `NOTICE`, `TAGMSG`, `AWAY`, and multiline messages
 - Queries: `WHO` (with WHOX), `WHOIS`, `ISON`, `USERHOST`, `MOTD`, `LUSERS`, `MONITOR`
-- IRCv3: capability negotiation 3.2, `cap-notify`, `server-time`, `echo-message`, `multi-prefix`, `userhost-in-names`, `extended-join`, `away-notify`, `invite-notify`, `monitor`, `extended-monitor`, `setname`, `bot-mode`, `no-implicit-names`, WHOX, `message-tags`, `message-ids`, `batch`, `labeled-response`, `standard-replies`, `draft/multiline`, `UTF8ONLY`, and the WebSocket transport (Cloudflare Workers only)
+- IRCv3: capability negotiation 3.2, `cap-notify`, `server-time`, `echo-message`, `multi-prefix`, `userhost-in-names`, `extended-join`, `away-notify`, `invite-notify`, `monitor`, `extended-monitor`, `setname`, `bot-mode`, `no-implicit-names`, WHOX, `message-tags`, `message-ids`, `batch`, `labeled-response`, `standard-replies`, `draft/multiline`, `UTF8ONLY`, `sasl` (3.1 and 3.2), `draft/account-registration`, `account-notify`, `account-tag`, and the WebSocket transport (Cloudflare Workers only)
   - `message-tags`: the client-only tags of `PRIVMSG`, `NOTICE`, and `TAGMSG` are relayed to the clients that have the capability, whether the sender has it or not, and `TAGMSG` is delivered only to them. The other tags of a client are never relayed. `CLIENTTAGDENY=` says that every client-only tag is allowed. `TAGMSG` is answered like `PRIVMSG`, without `RPL_AWAY`.
   - `msgid`: every `PRIVMSG`, `NOTICE`, `TAGMSG`, and multiline message has one, the same for all its recipients and the echo, and one for each target. It is like a ULID: the time in milliseconds and 80 random bits, so the IDs sort by time and do not repeat after a restart.
   - `labeled-response` is used only when the client also has `batch`, which it depends on. A label longer than 64 bytes is ignored. A message to oneself with `echo-message` comes twice, the delivered one without the label and the echo with it.
   - `draft/multiline` (`max-bytes=4096,max-lines=100` by default): a batch is checked as it comes and delivered when it ends, with the checks of `PRIVMSG` done once for the whole message. A client that does not have the capability, or `batch`, gets the lines one by one, without the blank ones, and with the message ID and the client-only tags on the first one. A batch that breaks a rule gets a `FAIL` and the rest of it is ignored, and so are the lines of a batch that is not open. One batch can be open at a time; it is dropped after `timeout` (30 seconds, checked by `tick()`) and on a disconnection. The other commands are handled as usual while a batch is open. The sender needs `draft/multiline` and `batch`.
   - `UTF8ONLY`: a line that is not UTF-8 gets `FAIL <command> INVALID_UTF8` and is not handled, and the client stays. A `QUIT` is handled without its reason.
   - `invite-notify`: the members of the channel that have it get the `INVITE` too.
-  - WHOX: `WHO <mask> %<fields>[,<token>]` replies with `RPL_WHOSPCRPL` (354). The address (`i`) is `255.255.255.255`, the account (`a`) is `0`, and the op level (`o`) is `n/a`. A token that is not one to three digits is ignored, and `t` is then `0`.
+  - WHOX: `WHO <mask> %<fields>[,<token>]` replies with `RPL_WHOSPCRPL` (354). The address (`i`) is `255.255.255.255`, the account (`a`) is `0` for a client that is not logged in, and the op level (`o`) is `n/a`. A token that is not one to three digits is ignored, and `t` is then `0`.
   - `MONITOR=100`. A client is told when a nickname that it monitors registers, changes to or from it, or quits.
-  - `extended-monitor`: a client that monitors another gets its `AWAY` with `away-notify`, and its `SETNAME` with `setname`, without sharing a channel.
+  - `extended-monitor`: a client that monitors another gets its `AWAY` with `away-notify`, its `ACCOUNT` with `account-notify`, and its `SETNAME` with `setname`, without sharing a channel.
   - `setname`: `SETNAME` changes the realname, which is at most `NAMELEN` (150) bytes, as is the one of `USER`. A realname that is not valid gets `FAIL SETNAME INVALID_REALNAME`.
   - Bot mode: `BOT=B`, `RPL_WHOISBOT` (335) in `WHOIS`, `B` in the flags of `WHO`, and the `bot` tag, for the clients with `message-tags`, on every message whose source is a client in bot mode, including the lines of its multiline batches.
 - `CASEMAPPING=ascii`. The lengths of `NICKLEN`, `CHANNELLEN`, `TOPICLEN`, `AWAYLEN`, `KICKLEN`, `KEYLEN`, and `NAMELEN` are in bytes.
@@ -116,17 +123,42 @@ The dependency is pinned to a commit, and pnpm builds it on install. To update i
 - The address of the client is passed to the server, from `CF-Connecting-IP` for a WebSocket and from the Worker for TCP (see below). It is not shown to the other users, who see a cloak (see below).
 - A client that does not answer a `PING` is disconnected, and so is one that has not registered in time after it connected.
 - Limits, set with the options of `createServer()`:
-  - `flood`: a token bucket for each connection, by default 10 commands at once and one more every 2 seconds, with `NICK`, `JOIN`, and `PART` taking more. A client that runs out is not disconnected: its commands wait until the tokens are back (fake lag), so a burst is handled in full and in order, only slower. The others are not slowed down. `false` turns it off. The lines of a multiline batch are free, and the batch takes one token for every 512 bytes or every 5 lines, whichever is more, when it ends.
+  - `flood`: a token bucket for each connection, by default 10 commands at once and one more every 2 seconds, with `NICK`, `JOIN`, `PART`, `AUTHENTICATE` (2), and `REGISTER` (3) taking more. `AUTHENTICATE` and `REGISTER`, which hash a password, take their cost before the registration too. A client that runs out is not disconnected: its commands wait until the tokens are back (fake lag), so a burst is handled in full and in order, only slower. The others are not slowed down. `false` turns it off. The lines of a multiline batch are free, and the batch takes one token for every 512 bytes or every 5 lines, whichever is more, when it ends.
   - `multiline`: `maxBytes` (4096), `maxLines` (100), and `timeout` (30 seconds) of a `draft/multiline` batch.
   - `maxConnections` (1000), `maxConnectionsPerIp` (10, when the runtime knows the address), and `maxChannels` (1000).
+  - `accounts`: see [Accounts](#accounts).
 
 ## What is not implemented
 
 - TLS over TCP. According to the Cloudflare documentation, Spectrum terminates TLS for a Worker only with the Enterprise add-on, and `startTls()` is not supported for an inbound socket. A WebSocket has TLS (`wss://`) once deployed, which has not been tried.
-- Accounts (`SASL`), operators, and server-to-server links. So there are no extended bans, such as by account.
+- Operators and server-to-server links. Extended bans, such as by account.
+- Of the accounts: the SASL mechanisms other than `PLAIN` (`SCRAM-SHA-256`, `EXTERNAL`), reauthentication (a client that is logged in gets `ERR_SASLALREADY`) and so logging out, email and verification, changing or resetting a password, deleting an account, `draft/ACCOUNTREQUIRED`, and rehashing a password with new parameters when it logs in.
+- Anything stored but the accounts: chat history, registered channels, always-on clients, read markers.
 - The WebSocket transport on Node.js, which has no WebSocket server built in. `src/websocket.ts` does not depend on a runtime.
-- The other IRCv3 extensions, such as `chathistory`, `account-tag`, and `STATUSMSG`. No standard reply is sent beyond what a spec defines, so `standard-replies` changes nothing yet.
+- The other IRCv3 extensions, such as `chathistory`, `chghost`, and `STATUSMSG`. No standard reply is sent beyond what a spec defines, so `standard-replies` changes nothing yet.
 - `ELIST`, and the parameters of `LIST`. `WHO` with a mask that is not a channel or a nickname. `KNOCK`.
+
+## Accounts
+
+A client registers an account with `REGISTER` (`draft/account-registration`) and logs in to it with SASL `PLAIN` (`AUTHENTICATE`), before or after the registration of the connection.
+
+- `REGISTER * * <password>` registers an account named after the current nickname (no `custom-account-name`), with the rules and the casemapping of the nicknames, and logs the client in, with `REGISTER SUCCESS` and `RPL_LOGGEDIN` (900). It works before the registration once the client has a nickname (`before-connect`). The email parameter is ignored and not stored, so nothing needs verification, and `VERIFY` only answers `INVALID_CODE` or `ALREADY_AUTHENTICATED`. The capability shows the limits of a password, `draft/account-registration=before-connect,min-password-length=8,max-password-length=300`; a password must also not be the name of the account, nor have a NUL, which SASL `PLAIN` could not carry. Every `FAIL` code of the spec that applies is sent: `NEED_NICK`, `BAD_ACCOUNT_NAME`, `ACCOUNT_NAME_MUST_BE_NICK`, `ACCOUNT_EXISTS`, `ALREADY_AUTHENTICATED`, `WEAK_PASSWORD`, `UNACCEPTABLE_PASSWORD`, and `TEMPORARILY_UNAVAILABLE` for the limits and for a closed registration.
+- `AUTHENTICATE PLAIN` follows sasl-3.1 and sasl-3.2: `sasl=PLAIN` in `CAP LS 302`, the response in chunks of 400 bytes of base64 (`+` after a last chunk of exactly 400), at most what `PLAIN` needs (`ERR_SASLTOOLONG`, 905), `*` to abort (906), `RPL_SASLMECHS` (908) for an unknown mechanism, and `RPL_LOGGEDIN` (900) and `RPL_SASLSUCCESS` (903). The authorization identity is empty or the account itself. A registration that completes during an exchange aborts it (906) and goes on without the account. A client that is logged in gets `ERR_SASLALREADY` (907): an account can not change on a connection, so there is no logout either. A connection is disconnected after its third failure, with the reason. Without a database, `sasl` and `draft/account-registration` are not advertised, and are refused.
+- A client that is logged in is shown with `ACCOUNT` to itself and to the others with `account-notify` (and to those that monitor it with `extended-monitor`), with the `account` tag (`account-tag`) on every message from it, in the extended `JOIN`, in WHOX (`a`), and with `RPL_WHOISACCOUNT` (330) in `WHOIS`. The `ACCOUNT` of a login is sent before the account is set, so it does not have the tag, as in the example of account-tag.
+- The name of an account is reserved as a nickname for the clients logged in to it (`reserveNicknames`, on by default). `NICK` gets `ERR_NICKNAMEINUSE` (433) with `Nickname is reserved by a different account`, which clients handle as for a nickname in use. Before the registration, the check is done when the registration completes, as a client sends `NICK` before it logs in with SASL; the registration stops with the same 433, the nickname is released, and the client sends another one.
+- The passwords are hashed with PBKDF2-HMAC-SHA-256 of WebCrypto, which both runtimes have, with a random salt of 16 bytes and 100,000 iterations, the most that Cloudflare Workers allows (`iterations`). The algorithm, the iterations, and the salt are stored with the hash, so the parameters can change. A password is never stored or logged; the hashes are compared in constant time.
+- The hash is asynchronous, and the handlers are synchronous: it is the prepare step of `AUTHENTICATE` and `REGISTER` (see [How it works](#how-it-works)). It runs only for a well-formed response to an existing account, or for a `REGISTER` that would succeed, and the handler reads the account again afterwards. A connection that closes meanwhile is left alone.
+- Limits, in `accounts` of `createServer()`: `registration` (`open`, or `closed`), `maxAccounts` (100,000), `maxPerAddress` (5 accounts from one address within `registrationWindow`, an hour), `maxFailures` (3 SASL failures on a connection), `throttle` (10 hashes at once for an address, and one more every 6 seconds), `minPasswordLength` (8), `maxPasswordLength` (300), and `reserveNicknames`. An address is an IPv4 address or an IPv6 /64, and the clients whose address is unknown count as one. It is stored as its cloak, a keyed hash, and only for the window.
+- The accounts are no secret, as their names are reserved, so a SASL attempt for a name that is not an account fails without a hash, faster.
+
+### Storage
+
+`src/store.ts` is a small synchronous SQL interface, `query(sql, ...params)` and `transaction(fn)`, with two implementations of SQLite, so the tests on Node.js run the queries of production:
+
+- On Cloudflare Workers, the SQLite database of the Durable Object, with `ctx.storage.sql.exec()` and `ctx.storage.transactionSync()`. It is in the storage of the object, so the accounts survive restarts and deploys. Under `cf dev`, it is in `.cloudflare/state`.
+- On Node.js, `node:sqlite` (`DatabaseSync`), in the file of `DATABASE`, or in memory without it. `createServer()` without `database` uses an in-memory database where the runtime has `node:sqlite`, which is loaded with `process.getBuiltinModule()`, so the bundle of the Worker does not import it.
+
+The schema is a list of migrations, each applied once in a transaction, at startup. A database whose schema is newer than the server is refused. The writes of an account are one transaction. The messages already have IDs that sort by time (`msgid`), so a table of history can be added as a migration.
 
 ## The address of the client
 

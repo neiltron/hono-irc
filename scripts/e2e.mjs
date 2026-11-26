@@ -47,13 +47,25 @@ const line = (bot, pattern) =>
     e.line.trimEnd()
   )
 
-const connect = (nick, caps = ['echo-message']) =>
+const connect = (nick, caps = ['echo-message'], options = {}) =>
   new Promise((resolve, reject) => {
     const bot = new IRC.Client()
     for (const cap of caps) {
       bot.requestCap(cap)
     }
-    bot.connect({ host, port, nick, username: nick, gecos: `${nick} real`, auto_reconnect: false })
+    // The account that the client has logged in to with SASL, as irc-framework tells it.
+    bot.on('loggedin', (e) => {
+      bot.loggedIn = e.account
+    })
+    bot.connect({
+      host,
+      port,
+      nick,
+      username: nick,
+      gecos: `${nick} real`,
+      auto_reconnect: false,
+      ...options,
+    })
     const timer = setTimeout(() => reject(new Error(`${nick} did not register`)), TIMEOUT)
     bot.on('registered', (e) => {
       clearTimeout(timer)
@@ -86,7 +98,7 @@ const tagged = (tags, command, ...params) =>
  * A client on a plain socket, for what irc-framework does not speak, such as draft/multiline, or
  * bytes that are not UTF-8.
  */
-const rawClient = async (nick, caps) => {
+const rawClient = async (nick, caps, before = []) => {
   const socket = connectSocket({ host, port })
   const lines = []
   let waiters = []
@@ -128,12 +140,14 @@ const rawClient = async (nick, caps) => {
   send(
     'CAP LS 302',
     `CAP REQ :${caps.join(' ')}`,
-    'CAP END',
     `NICK ${nick}`,
-    `USER ${nick} 0 * :${nick}`
+    `USER ${nick} 0 * :${nick}`,
+    // What the client sends before it ends the negotiation, e.g. REGISTER.
+    ...before,
+    'CAP END'
   )
   await waitFor(/ 376 /)
-  return { socket, send, waitFor }
+  return { socket, send, waitFor, lines }
 }
 
 const alice = await connect('alice', ['echo-message', 'labeled-response'])
@@ -505,6 +519,93 @@ await step('bot mode in WHOIS and WHO', async () => {
   const beep = once(alice, 'privmsg', (e) => e.message === 'beep')
   bob.say('#hono', 'beep')
   assert.equal((await beep).tags.bot, '')
+})
+
+// A new account on each run, so the test can run again against a server that keeps its accounts.
+const account = `acct${Math.floor(Math.random() * 1e6)}`
+const password = `pw-${crypto.randomUUID()}`
+
+await step('the capabilities of the accounts', async () => {
+  assert.equal(alice.network.cap.available.get('sasl'), 'PLAIN')
+  assert.match(
+    alice.network.cap.available.get('draft/account-registration'),
+    /^before-connect,min-password-length=\d+,max-password-length=\d+$/
+  )
+  // irc-framework asks for these itself when the server has them.
+  for (const cap of ['account-notify', 'account-tag', 'extended-join']) {
+    assert.ok(alice.network.cap.enabled.includes(cap), cap)
+  }
+})
+
+await step('REGISTER before the registration, from a raw client', async () => {
+  const raw = await rawClient(
+    account,
+    ['draft/account-registration'],
+    [`REGISTER * * :${password}`]
+  )
+  assert.match(
+    raw.lines.find((l) => / REGISTER SUCCESS /.test(l)),
+    new RegExp(`^:\\S+ REGISTER SUCCESS ${account} :`)
+  )
+  assert.match(
+    raw.lines.find((l) => / 900 /.test(l)),
+    new RegExp(` 900 ${account} .* ${account} :`)
+  )
+  // It completed the registration with the nickname that the account reserves.
+  assert.ok(raw.lines.some((l) => new RegExp(` 001 ${account} `).test(l)))
+  raw.send('QUIT')
+  await new Promise((resolve) => raw.socket.once('close', resolve))
+})
+
+await step('the reserved nickname, and a failed SASL authentication', async () => {
+  const bot = new IRC.Client()
+  const failed = once(bot, 'sasl failed')
+  const inUse = once(bot, 'nick in use')
+  bot.connect({
+    host,
+    port,
+    nick: account,
+    username: 'intruder',
+    gecos: 'intruder',
+    auto_reconnect: false,
+    account: { account, password: 'wrong password' },
+  })
+  assert.equal((await failed).reason, 'fail')
+  const refused = await inUse
+  assert.equal(refused.nick, account)
+  assert.match(refused.reason, /reserved/)
+  const registered = once(bot, 'registered')
+  bot.changeNick(`${account}_`)
+  assert.equal((await registered).nick, `${account}_`)
+  assert.equal(bot.loggedIn, undefined)
+  bot.quit()
+})
+
+let member
+await step('SASL PLAIN with irc-framework', async () => {
+  member = await connect(account, [], { account: { account, password } })
+  assert.equal(member.loggedIn, account)
+  assert.equal(member.user.nick, account)
+})
+
+await step('extended-join, account-tag, WHOIS, and WHOX show the account', async () => {
+  const joined = once(alice, 'join', (e) => e.nick === account)
+  member.join('#hono')
+  assert.equal((await joined).account, account)
+  const said = once(alice, 'privmsg', (e) => e.nick === account)
+  member.say('#hono', 'logged in')
+  assert.equal((await said).account, account)
+  assert.equal((await said).tags.account, account)
+  const whois = await new Promise((resolve) => alice.whois(account, resolve))
+  assert.equal(whois.account, account)
+  const who = await new Promise((resolve) => alice.who(account, resolve))
+  assert.equal(who.users[0].account, account)
+  // A client that is not logged in.
+  const others = await new Promise((resolve) => alice.who('alice', resolve))
+  assert.equal(others.users[0].account, '')
+  const gone = once(alice, 'quit', (e) => e.nick === account)
+  member.quit('bye')
+  await gone
 })
 
 await step('quit', async () => {
