@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vite-plus/test'
-import { connect, exchange, isupport, setup } from './test-utils.ts'
+import { parse } from './protocol.ts'
+import { connect, exchange, isupport, setup, strip, transcript } from './test-utils.ts'
+
+const tagsOf = (line: string) => parse(line)?.tags ?? {}
 
 describe('SETNAME', () => {
   it('Should change the realname and tell the clients with the capability', async () => {
@@ -102,5 +105,112 @@ describe('Bot mode', () => {
     ])
     expect(plain.lines.filter((line) => line.startsWith('@'))).toEqual([])
     expect(plain.lines.filter((line) => line.startsWith(':robo'))).toHaveLength(5)
+  })
+
+  it('Should tag a multiline batch of a bot, its fallback lines, and its labeled echo', async () => {
+    const { register } = setup()
+    const caps = ['batch', 'draft/multiline', 'message-tags']
+    const robo = await register('robo', [...caps, 'echo-message', 'labeled-response'])
+    const full = await register('full', caps)
+    const fallback = await register('fallback', ['message-tags'])
+    const plain = await register('plain')
+    for (const client of [robo, full, fallback, plain]) {
+      await exchange(client, 'JOIN #a')
+    }
+    await exchange(robo, 'MODE robo +B')
+    const echo = await transcript(
+      robo,
+      'BATCH +ml draft/multiline #a',
+      '@batch=ml PRIVMSG #a hello',
+      '@batch=ml PRIVMSG #a :again',
+      '@label=l1 BATCH -ml',
+      '@label=l2 PRIVMSG #a :single'
+    )
+    // The echo is labeled on its BATCH line, and every line of it is tagged.
+    expect(echo).toHaveLength(5)
+    expect(echo.map((line) => Object.keys(tagsOf(line)).sort())).toEqual([
+      ['bot', 'label', 'msgid'],
+      ['batch', 'bot'],
+      ['batch', 'bot'],
+      ['bot'],
+      ['bot', 'label', 'msgid'],
+    ])
+    expect(tagsOf(echo[0]).label).toBe('l1')
+    expect(tagsOf(echo[4]).label).toBe('l2')
+    expect(echo[4]).toMatch(/ :robo!\S+ PRIVMSG #a single$/)
+    for (const client of [full, fallback, plain]) {
+      await client.waitFor(/ PRIVMSG #a single$/)
+    }
+    const from = (client: typeof robo) => client.lines.filter((line) => /(^| ):robo!/.test(line))
+    // The whole batch with draft/multiline, and the lines without it, as with message-tags.
+    expect(from(full).map((line) => tagsOf(line).bot)).toEqual(['', '', '', '', ''])
+    expect(from(full).map((line) => line.split(' ')[2])).toEqual([
+      'BATCH',
+      'PRIVMSG',
+      'PRIVMSG',
+      'BATCH',
+      'PRIVMSG',
+    ])
+    expect(from(fallback).map((line) => [tagsOf(line).bot, strip(line)])).toEqual([
+      ['', 'PRIVMSG #a hello'],
+      ['', 'PRIVMSG #a again'],
+      ['', 'PRIVMSG #a single'],
+    ])
+    expect(from(plain).map((line) => line.split(' ').slice(1).join(' '))).toEqual([
+      'PRIVMSG #a hello',
+      'PRIVMSG #a again',
+      'PRIVMSG #a single',
+    ])
+  })
+})
+
+describe('Labeled responses of the channel and user commands', () => {
+  const caps = ['batch', 'labeled-response', 'setname']
+
+  it('Should label the replies of INVITE, MODE lists, WHOX, MONITOR, and SETNAME', async () => {
+    const { register } = setup()
+    const alice = await register('alice', caps)
+    const bob = await register('bob')
+    await exchange(alice, 'JOIN #a')
+    const labels = (lines: string[]) => lines.map((line) => tagsOf(line).label ?? '-')
+    // One line: the label is on it.
+    const invite = await transcript(alice, '@label=i1 INVITE bob #a')
+    expect(invite).toEqual([expect.stringMatching(/^@label=i1 :\S+ 341 alice bob #a$/)])
+    expect(await bob.waitFor(/ INVITE /)).not.toContain('label')
+    const empty = await transcript(alice, '@label=b0 MODE #a b')
+    expect(empty).toEqual([expect.stringMatching(/^@label=b0 :\S+ 368 alice #a :/)])
+    const setname = await transcript(alice, '@label=s1 SETNAME :Alice A')
+    expect(setname).toEqual([expect.stringMatching(/^@label=s1 :alice!\S+ SETNAME :Alice A$/)])
+    // Several lines: a labeled-response batch around them.
+    await exchange(alice, 'MODE #a +b x')
+    for (const [label, command] of [
+      ['b1', 'MODE #a b'],
+      ['w1', 'WHO #a %nf,5'],
+      ['m1', 'MONITOR + bob,nobody'],
+    ]) {
+      const lines = await transcript(alice, `@label=${label} ${command}`)
+      expect(lines[0]).toMatch(
+        new RegExp(`^@label=${label} :\\S+ BATCH \\+(\\S+) labeled-response$`)
+      )
+      const ref = lines[0].split(' ')[3].slice(1)
+      expect(lines.slice(1, -1).every((line) => tagsOf(line).batch === ref)).toBe(true)
+      expect(lines.at(-1)).toMatch(new RegExp(` BATCH -${ref}$`))
+      expect(labels(lines)).toEqual([label, ...Array(lines.length - 1).fill('-')])
+    }
+    // No reply: an ACK.
+    expect(await transcript(alice, '@label=m2 MONITOR - bob')).toEqual([
+      expect.stringMatching(/^@label=m2 :\S+ ACK$/),
+    ])
+  })
+
+  it('Should leave a MONITOR notification to the client out of its response', async () => {
+    const { register } = setup()
+    const alice = await register('alice', caps)
+    await exchange(alice, 'MONITOR + alice2')
+    const lines = await transcript(alice, '@label=n1 NICK alice2')
+    expect(lines).toEqual([
+      expect.stringMatching(/^@label=n1 :alice!\S+ NICK alice2$/),
+      expect.stringMatching(/^:\S+ 730 alice2 alice2!\S+$/),
+    ])
   })
 })

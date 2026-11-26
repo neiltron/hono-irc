@@ -151,13 +151,7 @@ export const createServer = (config: ServerOptions = {}) => {
     c.set('message', message)
     // The replies come from the server, and a numeric reply has the nickname of the client.
     c.setRenderer(((...lines: Line[]) => {
-      for (const [command, ...params] of lines) {
-        client.send({
-          source: server.name,
-          command,
-          params: [...(/^\d{3}$/.test(command) ? [client.nick] : []), ...params.map(String)],
-        })
-      }
+      server.reply(client, lines)
       return c.body(null)
     }) as ContextRenderer)
 

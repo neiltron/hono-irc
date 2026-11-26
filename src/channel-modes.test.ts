@@ -299,6 +299,37 @@ describe('Bans (+b) and exceptions (+e, +I)', () => {
     expect(await exchange(bob, 'NICK robert')).toEqual(['NICK robert'])
   })
 
+  it('Should keep a banned member from sending a TAGMSG or a multiline message', async () => {
+    const { register } = setup()
+    const caps = ['batch', 'draft/multiline', 'message-tags', 'echo-message']
+    const alice = await register('alice', caps)
+    const bob = await register('bob', caps)
+    await exchange(alice, 'JOIN #a')
+    await exchange(bob, 'JOIN #a')
+    await exchange(alice, 'MODE #a +b bob')
+    const multiline = [
+      'BATCH +ml draft/multiline #a',
+      '@batch=ml PRIVMSG #a hello',
+      '@batch=ml PRIVMSG #a :again',
+      'BATCH -ml',
+    ]
+    expect(await exchange(bob, '@+typing=active TAGMSG #a', ...multiline)).toEqual([
+      '404 bob #a :Cannot send to channel',
+      '404 bob #a :Cannot send to channel',
+    ])
+    await exchange(alice)
+    expect(alice.lines.filter((line) => /:bob!\S+ (TAGMSG|BATCH|PRIVMSG) /.test(line))).toEqual([])
+    // With voice, both go through.
+    await exchange(alice, 'MODE #a +v bob')
+    expect(
+      (await exchange(bob, '@+typing=active TAGMSG #a', ...multiline)).filter(
+        (line) => !line.startsWith('BATCH') && !line.startsWith('PRIVMSG')
+      )
+    ).toEqual(['TAGMSG #a'])
+    expect(await alice.waitFor(/ BATCH -/)).toMatch(/^:bob!\S+ BATCH -\S+$/)
+    expect(alice.lines.filter((line) => /:bob!\S+ PRIVMSG #a /.test(line))).toHaveLength(2)
+  })
+
   it('Should keep a banned client from sending from outside', async () => {
     const { alice, carol } = await channel()
     await exchange(alice, 'MODE #a -n+b carol')

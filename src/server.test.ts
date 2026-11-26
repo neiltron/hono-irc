@@ -1,43 +1,8 @@
 import { describe, expect, it } from 'vite-plus/test'
 import { createServer } from './server.ts'
-import type { ServerOptions } from './server.ts'
-import { connect } from './test-utils.ts'
-
-// The flood control is off unless a test turns it on.
-const setup = (config?: ServerOptions) => {
-  const server = createServer({ flood: false, ...config })
-  const handler = server.connect
-  /** Connect a client and complete the registration. */
-  const register = async (nick: string, capabilities: string[] = []) => {
-    const client = connect(handler)
-    if (capabilities.length) {
-      await client.send('CAP LS 302', `CAP REQ :${capabilities.join(' ')}`, 'CAP END')
-    }
-    await client.send(`NICK ${nick}`, `USER ${nick} 0 * :${nick} the user`)
-    await client.waitFor(/ 376 /)
-    return client
-  }
-  return { server, handler, register }
-}
+import { connect, exchange, isupport, setup } from './test-utils.ts'
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
-
-let sentinel = 0
-
-/**
- * Send the lines, and return what the client gets in reply. A PING follows them, and the lines
- * up to its PONG are returned, without the source of each line.
- */
-const exchange = async (client: ReturnType<typeof connect>, ...lines: string[]) => {
-  const token = `sentinel${++sentinel}`
-  const start = client.lines.length
-  await client.send(...lines, `PING ${token}`)
-  await client.waitFor(new RegExp(` PONG \\S+ ${token}$`))
-  return client.lines
-    .slice(start)
-    .filter((line) => !new RegExp(` PONG \\S+ ${token}$`).test(line))
-    .map((line) => line.replace(/^(@\S+ )?:\S+ /, ''))
-}
 
 /** The length of a line in bytes, with its CRLF and without its tags. */
 const bytes = (line: string) => Buffer.byteLength(line.replace(/^@\S+ /, '')) + 2
@@ -285,6 +250,87 @@ describe('Outbound messages', () => {
     expect(await bob.waitFor(/ PRIVMSG #hono /)).toMatch(/^:alice!\S+ PRIVMSG #hono Hello$/)
     expect(await bob.waitFor(/ PRIVMSG bob /)).toMatch(/^:alice!\S+ PRIVMSG bob psst$/)
     expect(bob.lines.filter((line) => line.startsWith('@'))).toEqual([])
+  })
+})
+
+describe('Advertised features', () => {
+  it('Should advertise each ISUPPORT token once, in lines that fit', async () => {
+    const { register } = setup()
+    const alice = await register('alice')
+    const lines = alice.lines.filter((line) => / 005 /.test(line))
+    const tokens = isupport(alice.lines)
+    const keys = tokens.map((token) => token.split('=')[0])
+    expect(new Set(keys).size).toBe(keys.length)
+    expect([...keys].sort()).toEqual(
+      [
+        'AWAYLEN',
+        'BOT',
+        'CASEMAPPING',
+        'CHANLIMIT',
+        'CHANMODES',
+        'CHANNELLEN',
+        'CHANTYPES',
+        'CLIENTTAGDENY',
+        'EXCEPTS',
+        'INVEX',
+        'KEYLEN',
+        'KICKLEN',
+        'MAXLIST',
+        'MODES',
+        'MONITOR',
+        'NAMELEN',
+        'NETWORK',
+        'NICKLEN',
+        'PREFIX',
+        'TARGMAX',
+        'TOPICLEN',
+        'UTF8ONLY',
+        'WHOX',
+      ].sort()
+    )
+    expect(tokens).toContain('TARGMAX=PRIVMSG:4,NOTICE:4,TAGMSG:4,KICK:4,NAMES:1,WHO:1,WHOIS:1')
+    for (const line of lines) {
+      expect(Buffer.byteLength(line) + 2).toBeLessThanOrEqual(512)
+      expect(line.split(' ').slice(3, -5).length).toBeLessThanOrEqual(13)
+    }
+    expect(alice.lines.find((line) => / 004 /.test(line))).toMatch(
+      / 004 alice irc\.hono\.local \S+ Bi Ibeiklmnostv Ibeklov$/
+    )
+  })
+
+  it('Should list each capability once in CAP LS, in lines that fit', async () => {
+    const { handler } = setup()
+    const client = connect(handler)
+    await client.send('CAP LS 302', 'CAP LS', 'PING :done')
+    await client.waitFor(/ PONG /)
+    const lines = client.lines.filter((line) => / CAP \* LS /.test(line))
+    const caps = (version: string[]) =>
+      version.flatMap((line) => line.slice(line.indexOf(' :') + 2).split(' '))
+    const latest = caps(lines.slice(0, -1)).map((cap) => cap.split('=')[0])
+    expect(new Set(latest).size).toBe(latest.length)
+    expect([...latest].sort()).toEqual([
+      'away-notify',
+      'batch',
+      'cap-notify',
+      'draft/multiline',
+      'echo-message',
+      'extended-join',
+      'extended-monitor',
+      'invite-notify',
+      'labeled-response',
+      'message-tags',
+      'multi-prefix',
+      'no-implicit-names',
+      'server-time',
+      'setname',
+      'standard-replies',
+      'userhost-in-names',
+    ])
+    // CAP LS without a version: the names, in one line.
+    expect(caps(lines.slice(-1))).toEqual(latest)
+    for (const line of lines) {
+      expect(Buffer.byteLength(line) + 2).toBeLessThanOrEqual(512)
+    }
   })
 })
 

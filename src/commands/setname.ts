@@ -1,7 +1,7 @@
 import { Hono } from 'tcp-hono'
 import { ERR_NEEDMOREPARAMS } from '../numerics.ts'
 import { byteLength } from '../protocol.ts'
-import { NAME_LENGTH, msg } from '../state.ts'
+import { NAME_LENGTH, fail, msg } from '../state.ts'
 import type { Env, Server } from '../state.ts'
 
 /**
@@ -21,10 +21,10 @@ export const setname = (server: Server) => {
     if (realname === undefined) {
       return c.render([ERR_NEEDMOREPARAMS, 'SETNAME', 'Not enough parameters'])
     }
-    // Empty, or longer than NAMELEN. The standard reply is sent as it is, with the server as the
-    // source.
+    // Empty, or longer than NAMELEN. The spec defines the reply, so it is sent with or without
+    // standard-replies.
     if (!realname || byteLength(realname) > NAME_LENGTH) {
-      return c.render(['FAIL', 'SETNAME', 'INVALID_REALNAME', 'Realname is not valid'])
+      return c.render(fail('SETNAME', 'INVALID_REALNAME', 'Realname is not valid'))
     }
     const changed = realname !== client.realname
     client.realname = realname

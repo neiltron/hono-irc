@@ -759,7 +759,7 @@ export class Server {
   /** Tell the clients that monitor a nickname that it is online, as the client, or offline. */
   notifyMonitors(nick: string, client?: Client) {
     for (const watcher of this.monitors.get(this.fold(nick)) ?? []) {
-      this.reply(watcher, client ? [RPL_MONONLINE, client.mask] : [RPL_MONOFFLINE, nick])
+      this.reply(watcher, [client ? [RPL_MONONLINE, client.mask] : [RPL_MONOFFLINE, nick]], false)
     }
   }
 
@@ -799,16 +799,21 @@ export class Server {
   }
 
   /**
-   * Send numeric replies to a client outside of its own command, e.g. a notification of MONITOR.
-   * The nickname of the client is inserted, as `c.render()` does for the requesting client.
+   * Send replies from the server to a client. A numeric reply gets the nickname of the client.
+   * `c.render()` sends the replies to the requesting client with this, and a notification such as
+   * one of MONITOR is sent with it too, with `response` false when it is not an answer to the
+   * command of the client, so that labeled-response leaves it out of the response.
    */
-  reply(client: Client, ...lines: Line[]) {
+  reply(client: Client, lines: Line[], response = true) {
     for (const [command, ...params] of lines) {
-      client.send({
-        source: this.name,
-        command,
-        params: [...(/^\d{3}$/.test(command) ? [client.nick] : []), ...params.map(String)],
-      })
+      client.send(
+        {
+          source: this.name,
+          command,
+          params: [...(/^\d{3}$/.test(command) ? [client.nick] : []), ...params.map(String)],
+        },
+        response
+      )
     }
   }
 

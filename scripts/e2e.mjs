@@ -501,6 +501,10 @@ await step('bot mode in WHOIS and WHO', async () => {
   assert.match(whois.bot, /is a Bot/)
   const who = await new Promise((resolve) => alice.who('robert', resolve))
   assert.equal(who.users[0].bot, true)
+  // irc-framework has message-tags, so it gets the `bot` tag.
+  const beep = once(alice, 'privmsg', (e) => e.message === 'beep')
+  bob.say('#hono', 'beep')
+  assert.equal((await beep).tags.bot, '')
 })
 
 await step('quit', async () => {

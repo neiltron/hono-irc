@@ -122,4 +122,4 @@ export const exchange = async (client: ReturnType<typeof connect>, ...lines: str
 
 /** The ISUPPORT tokens that a client got. */
 export const isupport = (lines: string[]) =>
-  lines.filter((line) => / 005 /.test(line)).flatMap((line) => line.split(' ').slice(3, -4))
+  lines.filter((line) => / 005 /.test(line)).flatMap((line) => line.split(' ').slice(3, -5))

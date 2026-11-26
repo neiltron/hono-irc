@@ -1,48 +1,23 @@
 import type { Connection } from 'tcp-hono'
 import { describe, expect, it } from 'vite-plus/test'
 import { parse } from './protocol.ts'
-import { createServer } from './server.ts'
 import type { ServerOptions } from './server.ts'
 import { Client, Server, fail, msg } from './state.ts'
-import { connect } from './test-utils.ts'
+import { connect, setup as serverSetup, transcript } from './test-utils.ts'
 
 // The IRCv3 extensions around message tags: message-tags, message-ids, batch, labeled-response,
 // standard-replies, draft/multiline, and UTF8ONLY.
 
-const setup = (config?: ServerOptions) => {
-  const server = createServer({ name: 'irc.example', flood: false, ...config })
-  const handler = server.connect
-  /** Connect a client and complete the registration. */
-  const register = async (nick: string, capabilities: string[] = []) => {
-    const client = connect(handler)
-    if (capabilities.length) {
-      await client.send('CAP LS 302', `CAP REQ :${capabilities.join(' ')}`, 'CAP END')
-    }
-    await client.send(`NICK ${nick}`, `USER ${nick} 0 * :${nick} the user`)
-    await client.waitFor(/ 376 /)
-    return client
-  }
-  return { server, handler, register }
-}
+// The flood control is off, as in `setup()` of the test utilities.
+const setup = (config?: ServerOptions) => serverSetup({ name: 'irc.example', ...config })
 
 type TestClient = ReturnType<typeof connect>
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 const encoder = new TextEncoder()
 
-let sentinel = 0
-
-/**
- * Send the lines, and return what the client gets in reply, with the tags. A PING follows them,
- * and the lines up to its PONG are returned.
- */
-const exchange = async (client: TestClient, ...lines: string[]) => {
-  const token = `sentinel${++sentinel}`
-  const start = client.lines.length
-  await client.send(...lines, `PING ${token}`)
-  await client.waitFor(new RegExp(` PONG \\S+ ${token}$`))
-  return client.lines.slice(start).filter((line) => !line.endsWith(` PONG irc.example ${token}`))
-}
+/** Send the lines, and return the replies with their tags and sources. */
+const exchange = transcript
 
 /** The lines that the client has received since the mark, without its PINGs. */
 const since = (client: TestClient, mark: number) => client.lines.slice(mark)
