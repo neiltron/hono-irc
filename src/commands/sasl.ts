@@ -81,10 +81,15 @@ const plain: Mechanism = {
     if (!credentials) {
       return
     }
-    if (!server.accounts!.throttle.take(addressKey(client))) {
+    const release = server.accounts!.admit(addressKey(client))
+    if (!release) {
       return THROTTLED
     }
-    return attempt(credentials.account, credentials.password)
+    try {
+      return await attempt(credentials.account, credentials.password)
+    } finally {
+      release()
+    }
   },
   step: (server, _client, response, prepared) => {
     // The account is read again: it may have changed during the derivation.

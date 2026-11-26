@@ -1,6 +1,6 @@
 import { Hono } from 'tcp-hono'
 import { ERR_INPUTTOOLONG, ERR_NEEDMOREPARAMS } from '../numerics.ts'
-import { INPUT_TOO_LONG, byteLength } from '../protocol.ts'
+import { INPUT_TOO_LONG, MAX_LINE_LENGTH, byteLength } from '../protocol.ts'
 import type { IRCMessage } from '../protocol.ts'
 import { MAX_TARGETS, clientTags, echo, fail, msg, tooMany } from '../state.ts'
 import type { Client, Env, InboundBatch, Line, Server } from '../state.ts'
@@ -11,13 +11,20 @@ const TYPE = MULTILINE
 const REF_PATTERN = /^[A-Za-z0-9-]+$/
 
 /**
+ * What the lines that a batch has received cost: one token for every 512 bytes of the lines as
+ * they came, tags included, or every 5 lines, whichever is more, and at least one.
+ */
+const cost = (batch: InboundBatch) =>
+  Math.max(1, Math.ceil(batch.raw / 512), Math.ceil(batch.received / 5))
+
+/**
  * What a line costs the flood control, if it is part of a multiline batch, and `undefined` for
- * the other lines. A line of the open batch is free, and the batch is charged as a whole when it
- * closes: one token for every 512 bytes of its text or every 5 lines, whichever is more, and at
- * least one. A client may send a whole batch at once, as the spec expects, and it reaches the
- * others at once; the bytes cost what they would as single lines, and the lines up to five times
- * less. A batch is bounded by `max-bytes` and `max-lines`, and once it fails, its lines cost as
- * usual.
+ * the other lines. A line of the open batch is free when it comes, and the batch is charged as a
+ * whole when it ends (see `cost()`): when it closes, here, or when it fails or times out, in
+ * `abandon()`, so a batch that fails is not free. A client may send a whole batch at once, as the
+ * spec expects, and it reaches the others at once; the bytes cost what they would as single lines,
+ * and the lines up to five times less. A batch is bounded by `max-bytes` and `max-lines`, and once
+ * it has ended, the lines of its reference cost as usual.
  */
 export const batchCost = (client: Client, message: IRCMessage): number | undefined => {
   const batch = client.inbound
@@ -28,8 +35,32 @@ export const batchCost = (client: Client, message: IRCMessage): number | undefin
     return 0
   }
   if (message.command === 'BATCH' && message.params[0] === '-' + batch.ref) {
-    return Math.max(1, Math.ceil(batch.bytes / 512), Math.ceil(batch.lines.length / 5))
+    return cost(batch)
   }
+}
+
+/** Count a line of the open batch, of `size` bytes as it came, for what the batch costs. */
+export const receive = (batch: InboundBatch, size: number) => {
+  batch.received++
+  batch.raw += size
+}
+
+/**
+ * Drop the open batch of the client, which has failed, and charge the flood control what its
+ * lines cost. Returns the FAIL to send.
+ */
+export const abandon = (
+  server: Server,
+  client: Client,
+  code: string,
+  ...rest: [...string[], string]
+): Line => {
+  const batch = client.inbound
+  client.inbound = undefined
+  if (batch) {
+    server.charge(client, cost(batch))
+  }
+  return fail('BATCH', code, ...rest)
 }
 
 /** Give up a batch that has been open for too long. `tick()` calls it. */
@@ -37,10 +68,14 @@ export const expire = (server: Server, client: Client, now: number) => {
   const batch = client.inbound
   // A client whose closing line waits for the flood control has sent it in time.
   if (batch && !client.delayed && now - batch.opened > server.multiline.timeout) {
-    client.inbound = undefined
-    client.send(
-      msg(server.name, 'FAIL', 'BATCH', 'TIMEOUT', batch.ref, 'Multiline batch timed out')
+    const [command, ...params] = abandon(
+      server,
+      client,
+      'TIMEOUT',
+      batch.ref,
+      'Multiline batch timed out'
     )
+    client.send(msg(server.name, command, ...params.map(String)))
   }
 }
 
@@ -61,17 +96,15 @@ export const multiline = (server: Server) => {
   server.capabilities.set(TYPE, `max-bytes=${maxBytes},max-lines=${maxLines}`)
   server.tagCapabilities.set(CONCAT, TYPE)
 
-  // The batch fails: it is dropped, and the lines of its reference that follow are ignored, as
-  // those of a batch that is not open.
-  const reject = (client: Client, code: string, ...rest: [...string[], string]): Line => {
-    client.inbound = undefined
-    return fail('BATCH', code, ...rest)
-  }
+  // The batch fails: it is dropped, and charged what it has cost, and the lines of its reference
+  // that follow are ignored, as those of a batch that is not open.
+  const reject = (client: Client, code: string, ...rest: [...string[], string]): Line =>
+    abandon(server, client, code, ...rest)
 
   // A line with a `batch` tag belongs to that batch, whatever its command, so it is taken here,
   // before the routes of the commands.
   app.use('*', async (c, next) => {
-    const { client, message } = c.var
+    const { client, message, size } = c.var
     const ref = message.tags?.batch
     const batch = client.inbound
     if (ref === undefined) {
@@ -82,6 +115,8 @@ export const multiline = (server: Server) => {
       // long still gets its reply.
       return message.command === INPUT_TOO_LONG ? next() : c.render()
     }
+    // A line that was too long has come with its tags at most, and was longer than a line.
+    receive(batch, message.command === INPUT_TOO_LONG ? Math.max(size, MAX_LINE_LENGTH) : size)
     if (message.command === INPUT_TOO_LONG) {
       return c.render(
         [ERR_INPUTTOOLONG, 'Input line was too long'],
@@ -191,7 +226,16 @@ export const multiline = (server: Server) => {
       if (!tags) {
         return c.render([ERR_INPUTTOOLONG, 'Input line was too long'])
       }
-      client.inbound = { ref, target, lines: [], bytes: 0, tags, opened: Date.now() }
+      client.inbound = {
+        ref,
+        target,
+        lines: [],
+        bytes: 0,
+        tags,
+        opened: Date.now(),
+        received: 0,
+        raw: 0,
+      }
       return c.render()
     }
 

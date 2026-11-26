@@ -3,11 +3,9 @@ import { getConnection } from 'tcp-hono'
 import type { Connection } from 'tcp-hono'
 import { batchCost } from './commands/multiline.ts'
 import { parse } from './protocol.ts'
-import type { Client, Env, Server } from './state.ts'
+import type { Env, Server } from './state.ts'
 
 const decoder = new TextDecoder()
-
-type Bucket = { tokens: number; at: number; registered: boolean }
 
 // A wait is done in slices of this many milliseconds, so it ends soon after the connection closes.
 const SLICE = 50
@@ -42,8 +40,6 @@ const wait = async (ms: number, connection: Connection) => {
  * are rejected before the registration, and it waits before the outbox is opened.
  */
 export const flood = (server: Server) => {
-  const buckets = new WeakMap<Client, Bucket>()
-
   return async (c: Context<Env>, next: Next) => {
     const options = server.flood
     const connection = getConnection(c)
@@ -51,15 +47,6 @@ export const flood = (server: Server) => {
     if (!options || !client) {
       return next()
     }
-    const now = Date.now()
-    let bucket = buckets.get(client)
-    if (!bucket || bucket.registered !== client.registered) {
-      bucket = { tokens: options.burst, at: now, registered: client.registered }
-      buckets.set(client, bucket)
-    }
-    bucket.tokens = Math.min(options.burst, bucket.tokens + (now - bucket.at) / options.interval)
-    bucket.at = now
-
     // The path is the command and the parameters, each percent-encoded.
     const command = decodeURIComponent(c.req.path.split('/')[1] ?? '')
     // A command with a prepare step does slow work, such as deriving a key from a password, so it
@@ -71,12 +58,12 @@ export const flood = (server: Server) => {
       const message = parse(decoder.decode(await c.req.arrayBuffer()))
       cost = (message && batchCost(client, message)) ?? cost
     }
-    bucket.tokens -= cost
-    if (bucket.tokens < 0) {
+    const tokens = server.charge(client, cost)
+    if (tokens < 0) {
       // The client is not silent while it waits, so the ping timeout leaves it alone.
       client.delayed = true
       try {
-        await wait(-bucket.tokens * options.interval, connection)
+        await wait(-tokens * options.interval, connection)
       } finally {
         client.delayed = false
       }

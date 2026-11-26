@@ -32,6 +32,12 @@ export type AccountOptions = {
    * make the server compute, however many times it reconnects.
    */
   throttle?: { burst?: number; interval?: number }
+  /**
+   * The keys derived from passwords on the whole server, whatever the addresses: at most
+   * `concurrent` at a time, `burst` at once, and one more every `interval` milliseconds. A
+   * derivation over it is refused as one over `throttle` is.
+   */
+  derivations?: { concurrent?: number; burst?: number; interval?: number }
 }
 
 /** The algorithm of the stored passwords. */
@@ -117,9 +123,10 @@ export const verify = (account: Account, attempt: Attempt) =>
   equal(attempt.hash, fromBase64(account.hash))
 
 /**
- * Token buckets by key, for the derivations of each address. The buckets that are full again are
- * forgotten, so the map holds only the keys that were busy recently, and at most `maxKeys`: past
- * that, a new key is refused until some are forgotten.
+ * Token buckets by key, such as the derivations or the connections of each address. The buckets
+ * that are full again are forgotten, so the map holds only the keys that were busy recently, and at
+ * most `maxKeys`: past that, the one that was used the longest ago goes. A new key is never refused
+ * because the map is full, as many addresses could otherwise keep every other one out.
  */
 export class Throttle {
   #buckets = new Map<string, { tokens: number; at: number }>()
@@ -136,16 +143,20 @@ export class Throttle {
   /** Take a token for the key, if it has one. */
   take(key: string, now = Date.now()): boolean {
     let bucket = this.#buckets.get(key)
-    if (!bucket) {
+    if (bucket) {
+      // The map is in the order of use.
+      this.#buckets.delete(key)
+    } else {
       if (this.#buckets.size >= this.maxKeys) {
         this.#prune(now)
       }
       if (this.#buckets.size >= this.maxKeys) {
-        return false
+        const [oldest] = this.#buckets.keys()
+        this.#buckets.delete(oldest)
       }
       bucket = { tokens: this.burst, at: now }
-      this.#buckets.set(key, bucket)
     }
+    this.#buckets.set(key, bucket)
     bucket.tokens = Math.min(this.burst, bucket.tokens + (now - bucket.at) / this.interval)
     bucket.at = now
     if (bucket.tokens < 1) {
@@ -183,6 +194,15 @@ export const addressKey = (client: { ip?: string; host: string }) => {
 }
 
 /**
+ * The key of the IPv6 /48 of a client, from its cloak, `<128>.<64>.<48>.ip6`, or `undefined` for a
+ * client that is not on IPv6.
+ */
+export const networkKey = (client: { ip?: string; host: string }) =>
+  client.ip !== undefined && client.host.endsWith('.ip6')
+    ? client.host.split('.').slice(2).join('.')
+    : undefined
+
+/**
  * The accounts in the store. Every method is synchronous, so a handler can use it while its outbox
  * is open. The names are folded by the casemapping of the server, as nicknames.
  */
@@ -199,6 +219,10 @@ export class Accounts {
   registrationWindow: number
   maxFailures: number
   throttle: Throttle
+  /** The derivations of the whole server. See `derivations` of `AccountOptions`. */
+  derivations: Throttle
+  maxConcurrent: number
+  #running = 0
 
   constructor(store: Store, fold: (name: string) => string, options: AccountOptions = {}) {
     this.store = store
@@ -215,6 +239,34 @@ export class Accounts {
     this.registrationWindow = options.registrationWindow ?? 3_600_000
     this.maxFailures = options.maxFailures ?? 3
     this.throttle = new Throttle(options.throttle?.burst ?? 10, options.throttle?.interval ?? 6000)
+    this.derivations = new Throttle(
+      options.derivations?.burst ?? 20,
+      options.derivations?.interval ?? 250
+    )
+    this.maxConcurrent = options.derivations?.concurrent ?? 4
+  }
+
+  /**
+   * Admit a derivation of a key for the address: within the throttle of the address, and the one of
+   * the server. Returns the function to call when the derivation is done, or `undefined` if it is
+   * refused. The address is charged first, so that the requests of an address that is refused can
+   * not use up the tokens of the server.
+   */
+  admit(address: string): (() => void) | undefined {
+    if (this.#running >= this.maxConcurrent || !this.throttle.take(address)) {
+      return
+    }
+    if (!this.derivations.take('server')) {
+      return
+    }
+    this.#running++
+    let released = false
+    return () => {
+      if (!released) {
+        released = true
+        this.#running--
+      }
+    }
   }
 
   /** The account of a name, if it is registered. */

@@ -7,7 +7,7 @@ import { chathistory } from './commands/chathistory.ts'
 import { messages } from './commands/messages.ts'
 import { markread } from './commands/markread.ts'
 import { modes } from './commands/modes.ts'
-import { expire, multiline } from './commands/multiline.ts'
+import { abandon, expire, multiline, receive } from './commands/multiline.ts'
 import { monitor } from './commands/monitor.ts'
 import { queries } from './commands/queries.ts'
 import { registration } from './commands/registration.ts'
@@ -20,8 +20,17 @@ import {
   ERR_UNKNOWNCOMMAND,
   ERR_UNKNOWNERROR,
 } from './numerics.ts'
-import { INPUT_TOO_LONG, byteLength, format, irc, parse, parseTags } from './protocol.ts'
+import {
+  INPUT_TOO_LONG,
+  MAX_LINE_LENGTH,
+  byteLength,
+  format,
+  irc,
+  parse,
+  parseTags,
+} from './protocol.ts'
 import type { IRCMessage } from './protocol.ts'
+import { addressKey, networkKey } from './accounts.ts'
 import { Client, Server, fail, msg } from './state.ts'
 import type { ConnectionInfo, Env, Line, OutboxEntry, ServerOptions } from './state.ts'
 
@@ -164,6 +173,7 @@ export const createServer = (config: ServerOptions = {}) => {
     client.pinged = false
     c.set('client', client)
     c.set('message', message)
+    c.set('size', bytes.length)
 
     // The slow step of the command, if it has one, before the outbox is opened, like the wait of
     // the flood control: what the others send meanwhile is pushed as usual. It runs only for a
@@ -228,10 +238,11 @@ export const createServer = (config: ServerOptions = {}) => {
               )
         )
         if (client.inbound && client.inbound.ref === message.tags?.batch) {
-          client.inbound = undefined
+          receive(client.inbound, bytes.length)
           c.render(
-            fail(
-              'BATCH',
+            abandon(
+              server,
+              client,
               'MULTILINE_INVALID',
               utf8
                 ? 'Invalid multiline batch with a forbidden character'
@@ -249,6 +260,25 @@ export const createServer = (config: ServerOptions = {}) => {
     }
     await handled
 
+    // The response is written whole, whether the client reads it or not, so it is bounded: one
+    // that is longer than `maxReplyBytes` is not sent, and the client is disconnected.
+    const respond = (lines: string[]) => {
+      let bytes = 0
+      for (const line of lines) {
+        bytes += byteLength(line) + 2
+      }
+      if (bytes <= server.maxReplyBytes) {
+        // The headers are kept for `Connection: close`.
+        c.res = new Response(lines.join('\r\n'), { headers: c.res.headers })
+        return
+      }
+      client.quit = 'Reply too long'
+      const error = format(
+        { command: 'ERROR', params: [`Closing Link: ${client.host} (${client.quit})`] },
+        MAX_LINE_LENGTH - 2
+      )
+      c.res = new Response(error, { headers: { Connection: 'close' } })
+    }
     if (label !== undefined) {
       // A body that a handler writes itself, such as the ERROR of QUIT, is part of the response.
       const body = c.finalized ? await c.res.text() : ''
@@ -258,17 +288,12 @@ export const createServer = (config: ServerOptions = {}) => {
         .filter((message) => message !== undefined)
         .map((message) => ({ message, response: true }))
       const lines = labelResponse(server, client, label, [...outbox, ...written])
-      c.res = new Response(lines.map(({ message }) => client.format(message)).join('\r\n'), {
-        headers: c.res.headers,
-      })
+      respond(lines.map(({ message }) => client.format(message)))
     } else if (outbox.length) {
       // A body that a handler writes itself, such as the ERROR of QUIT, follows the outbox.
       const body = c.finalized ? await c.res.text() : ''
       const lines = outbox.map(({ message }) => client.format(message))
-      // The headers are kept for `Connection: close`.
-      c.res = new Response([...lines, ...(body ? [body] : [])].join('\r\n'), {
-        headers: c.res.headers,
-      })
+      respond([...lines, ...(body ? [body] : [])])
     }
   })
 
@@ -304,16 +329,40 @@ export const createServer = (config: ServerOptions = {}) => {
   // The information about the connection that `connect()` hands over to `onOpen()`.
   let pending: ConnectionInfo | undefined
 
+  /** Add `delta` to the count of a key, which is forgotten at 0. */
+  const count = (counts: Map<string, number>, key: string | undefined, delta: number) => {
+    if (key === undefined) {
+      return
+    }
+    const value = (counts.get(key) ?? 0) + delta
+    if (value > 0) {
+      counts.set(key, value)
+    } else {
+      counts.delete(key)
+    }
+  }
+
   const options: TCPOptions = {
     protocol: irc(),
+    maxBufferedBytes: server.maxBufferedBytes,
     onOpen: (connection) => {
-      const ip = pending?.ip
+      // The client is made first, as its cloak gives the keys of its address and its network.
+      const client = new Client(server, connection, pending)
+      const known = client.ip !== undefined
+      const address = known ? addressKey(client) : undefined
+      const network = networkKey(client)
       const reason =
         server.clients.size >= server.maxConnections
           ? 'Too many connections'
-          : ip !== undefined && (server.addresses.get(ip) ?? 0) >= server.maxConnectionsPerIp
+          : known && (server.addresses.get(address!) ?? 0) >= server.maxConnectionsPerIp
             ? 'Too many connections from your address'
-            : undefined
+            : network !== undefined &&
+                (server.networks.get(network) ?? 0) >= server.maxConnectionsPerNetwork
+              ? 'Too many connections from your network'
+              : // Every attempt counts, so a client that is refused can not try again at once.
+                known && !server.connectionRate.take(address!)
+                ? 'Too many connections from your address, try again later'
+                : undefined
       if (reason) {
         // The connection does not get a client. tcp-hono writes the ERROR, ends the read loop,
         // and calls `onClose()`, which has nothing to clean up.
@@ -323,10 +372,9 @@ export const createServer = (config: ServerOptions = {}) => {
         connection.close()
         return
       }
-      server.clients.set(connection, new Client(server, connection, pending))
-      if (ip !== undefined) {
-        server.addresses.set(ip, (server.addresses.get(ip) ?? 0) + 1)
-      }
+      server.clients.set(connection, client)
+      count(server.addresses, address, 1)
+      count(server.networks, network, 1)
     },
     onClose: (connection) => {
       // tcp-hono calls `onClose()` for every connection that it called `onOpen()` for, including
@@ -341,12 +389,8 @@ export const createServer = (config: ServerOptions = {}) => {
       // Its invites and its list of MONITOR, before the others are told that it has gone.
       server.forget(client)
       if (client.ip !== undefined) {
-        const count = (server.addresses.get(client.ip) ?? 1) - 1
-        if (count) {
-          server.addresses.set(client.ip, count)
-        } else {
-          server.addresses.delete(client.ip)
-        }
+        count(server.addresses, addressKey(client), -1)
+        count(server.networks, networkKey(client), -1)
       }
       // The nickname is freed after the QUIT, so the QUIT of a bot still has the `bot` tag.
       for (const peer of server.peers(client)) {
@@ -388,11 +432,8 @@ export const createServer = (config: ServerOptions = {}) => {
    */
   const tick = () => {
     const now = Date.now()
-    try {
-      server.expire(now)
-    } catch (error) {
-      console.error(error)
-    }
+    // It reports a failure of the database itself.
+    server.expire(now)
     for (const client of server.clients.values()) {
       expire(server, client, now)
       // A client whose command waits for the flood control has sent something, which is handled
@@ -432,5 +473,7 @@ export const createServer = (config: ServerOptions = {}) => {
     isupport: server.isupport,
     /** The accounts in the database, if the server has one. */
     accounts: server.accounts,
+    /** The bytes that may wait to be sent to a connection, which a WebSocket is also given. */
+    maxBufferedBytes: server.maxBufferedBytes,
   }
 }

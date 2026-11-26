@@ -293,7 +293,9 @@ describe('Advertised features', () => {
         'WHOX',
       ].sort()
     )
-    expect(tokens).toContain('TARGMAX=PRIVMSG:4,NOTICE:4,TAGMSG:4,KICK:4,NAMES:1,WHO:1,WHOIS:1')
+    expect(tokens).toContain(
+      'TARGMAX=PRIVMSG:4,NOTICE:4,TAGMSG:4,KICK:4,NAMES:1,WHO:1,WHOIS:1,JOIN:10'
+    )
     for (const line of lines) {
       expect(Buffer.byteLength(line) + 2).toBeLessThanOrEqual(512)
       expect(line.split(' ').slice(3, -5).length).toBeLessThanOrEqual(13)
@@ -607,7 +609,9 @@ describe('Targets', () => {
     const { register } = setup()
     const alice = await register('alice')
     const tokens = alice.lines.filter((line) => / 005 /.test(line)).join(' ')
-    expect(tokens).toContain(' TARGMAX=PRIVMSG:4,NOTICE:4,TAGMSG:4,KICK:4,NAMES:1,WHO:1,WHOIS:1 ')
+    expect(tokens).toContain(
+      ' TARGMAX=PRIVMSG:4,NOTICE:4,TAGMSG:4,KICK:4,NAMES:1,WHO:1,WHOIS:1,JOIN:10 '
+    )
     expect(tokens).toContain(' AWAYLEN=300 ')
     expect(tokens).toContain(' KICKLEN=300 ')
     expect(tokens).toContain(' CHANNELLEN=50 ')

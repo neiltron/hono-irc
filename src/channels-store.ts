@@ -26,13 +26,30 @@ export type ChannelRow = {
   lists: string
   history: number | null
   used: number
+  /** The msgid from which every member reads the history, or NULL for all of it. */
+  since: string | null
 }
 
 /** An entry of a list as it is stored: the mode, the mask, who set it, and when. */
 export type StoredEntry = [mode: ListMode, mask: string, by: string, at: number]
 
+/** What is stored of a channel: everything but the members and the invites. */
+export type StoredChannel = Pick<
+  Channel,
+  | 'name'
+  | 'created'
+  | 'founder'
+  | 'modes'
+  | 'key'
+  | 'limit'
+  | 'topic'
+  | 'lists'
+  | 'history'
+  | 'since'
+>
+
 /** The state of a channel that is stored, which is everything but the members and the invites. */
-const state = (channel: Channel) => [
+const state = (channel: StoredChannel) => [
   // The type D modes, of which `P` itself, which every stored channel has.
   [...channel.modes].sort().join(''),
   channel.key ?? null,
@@ -86,24 +103,25 @@ export class ChannelStore {
   }
 
   /** Store a channel that becomes permanent. It must have a founder. */
-  insert(folded: string, channel: Channel, now = Date.now()) {
+  insert(folded: string, channel: StoredChannel, now = Date.now()) {
     this.store.query(
       `INSERT INTO channels (folded, name, created, founder, modes, key, max_members, topic,
-         topic_by, topic_at, lists, history, used)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         topic_by, topic_at, lists, history, used, since)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       folded,
       channel.name,
       channel.created,
       channel.founder!,
       ...state(channel),
       channel.history ?? null,
-      now
+      now,
+      channel.since ?? null
     )
     this.count++
   }
 
   /** Write the state of a permanent channel after a change: its modes, topic, or lists. */
-  save(folded: string, channel: Channel) {
+  save(folded: string, channel: StoredChannel) {
     this.store.query(
       `UPDATE channels SET modes = ?, key = ?, max_members = ?, topic = ?, topic_by = ?,
          topic_at = ?, lists = ? WHERE folded = ?`,
@@ -129,10 +147,14 @@ export class ChannelStore {
     }
   }
 
-  /** The permanent channels that are not secret, for LIST. */
-  listed(): Pick<ChannelRow, 'folded' | 'name' | 'topic'>[] {
+  /**
+   * The first permanent channels that are not secret, in the order of their names, for LIST: at
+   * most `limit`, from the index `channels_listed`.
+   */
+  listed(limit: number): Pick<ChannelRow, 'folded' | 'name' | 'topic'>[] {
     return this.store.query(
-      "SELECT folded, name, topic FROM channels WHERE instr(modes, 's') = 0 ORDER BY folded"
+      "SELECT folded, name, topic FROM channels WHERE instr(modes, 's') = 0 ORDER BY folded LIMIT ?",
+      limit
     )
   }
 

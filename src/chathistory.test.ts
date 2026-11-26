@@ -3,7 +3,7 @@ import { History, encodeTime } from './history.ts'
 import { parse } from './protocol.ts'
 import type { ServerOptions } from './server.ts'
 import type { Chat } from './state.ts'
-import { memoryStore } from './store.ts'
+import { MIGRATIONS, memoryStore, migrate } from './store.ts'
 import type { Store } from './store.ts'
 import { connect, isupport, setup as serverSetup, transcript } from './test-utils.ts'
 
@@ -529,11 +529,15 @@ describe('Multiline messages', () => {
       lines.push(`@batch=m PRIVMSG #a :${'\x02'.repeat(i ? 39 : 136)}`)
     }
     expect((await transcript(alice, ...lines, 'BATCH -m'))[0]).toMatch(/ BATCH \+/)
-    const [row] = store.query<{ size: number }>(
-      'SELECT length(CAST(lines AS BLOB)) + length(CAST(tags AS BLOB)) AS size FROM history'
+    const [row] = store.query<{ bytes: number; tags: string | null; size: number }>(
+      'SELECT length(CAST(lines AS BLOB)) AS bytes, tags, size FROM history'
     )
-    expect(row.size).toBeGreaterThan(4000 * 6)
-    expect(row.size).toBeLessThan(2_000_000)
+    expect(row.bytes).toBeGreaterThan(4000 * 6)
+    // The tags are over `maxStoredTags`: they were relayed, and are not stored.
+    expect(row.tags).toBe(null)
+    // The size that the budgets count is the size of the row.
+    expect(row.size).toBeGreaterThan(row.bytes)
+    expect(row.size).toBeLessThan(row.bytes + 1000)
   })
 })
 
@@ -632,6 +636,95 @@ describe('Retention', () => {
     expect(history.store.query('SELECT * FROM targets')).toEqual([])
   })
 
+  it('Should keep the newest messages that fit in the bytes of a target and of the server', () => {
+    const store = serverStore()
+    const history = new History(store, { maxTargetBytes: 2000, maxBytes: 3000 })
+    const a = history.createTarget(true)
+    const b = history.createTarget(true)
+    const now = Date.now()
+    const big = (i: number, target = '#a') => ({
+      ...chat(i, now + i),
+      target,
+      text: `m${i}:${'x'.repeat(300)}`,
+    })
+    const names = (h: History, t: number) => texts(h, t).map((text) => text!.split(':')[0])
+    const bytes = (target?: number) =>
+      store.query<{ n: number }>(
+        `SELECT coalesce(sum(size), 0) AS n FROM history${target ? ' WHERE target = ?' : ''}`,
+        ...(target ? [target] : [])
+      )[0].n
+    for (let i = 0; i < 20; i++) {
+      history.add(a, big(i), now)
+    }
+    // A row is about 470 bytes: four fit in 2000.
+    expect(bytes(a)).toBeLessThanOrEqual(2000)
+    expect(texts(history, a)).toHaveLength(4)
+    for (let i = 20; i < 40; i++) {
+      history.add(b, big(i, '#b'), now)
+    }
+    // The server keeps 3000 bytes, the newest: the four of b, and two of a.
+    expect(bytes()).toBeLessThanOrEqual(3000)
+    expect(texts(history, b)).toHaveLength(4)
+    expect(names(history, a)).toEqual(['m18', 'm19'])
+    // After a restart, the bytes are read again.
+    const again = new History(store, { maxTargetBytes: 2000, maxBytes: 3000 })
+    again.add(a, big(40), now)
+    expect(bytes()).toBeLessThanOrEqual(3000)
+    expect(names(again, a)).toEqual(['m19', 'm40'])
+  })
+
+  it('Should free at least the size of a message, however small the oldest ones are', () => {
+    const store = serverStore()
+    const history = new History(store, { maxTargetBytes: 20_000 })
+    const target = history.createTarget(true)
+    const now = Date.now()
+    for (let i = 0; i < 150; i++) {
+      history.add(target, chat(i, now + i), now)
+    }
+    // Messages of about 4 KB, each of which deletes dozens of the small ones.
+    for (let i = 150; i < 160; i++) {
+      const lines = Array.from({ length: 100 }, () => ({ text: '\x01'.repeat(5), concat: false }))
+      history.add(target, { ...chat(i, now + i), text: undefined, lines }, now)
+      const [{ n }] = store.query<{ n: number }>('SELECT sum(size) AS n FROM history')
+      expect(n).toBeLessThanOrEqual(20_000)
+    }
+  })
+
+  it('Should store the client-only tags as on a line, and only if they fit', () => {
+    const store = serverStore()
+    const history = new History(store, { maxStoredTags: 30 })
+    const target = history.createTarget(true)
+    const now = Date.now()
+    history.add(target, { ...chat(0, now), tags: { '+a': 'x y;z', '+b': '' } }, now)
+    history.add(target, { ...chat(1, now + 1), tags: { '+a': 'x'.repeat(40) } }, now)
+    expect(store.query('SELECT tags FROM history ORDER BY id')).toEqual([
+      { tags: '+a=x\\sy\\:z;+b' },
+      { tags: null },
+    ])
+    expect(history.page(target, 'ASC', '', '~', 10).map(({ tags }) => tags)).toEqual([
+      { '+a': 'x y;z', '+b': '' },
+      {},
+    ])
+  })
+
+  it('Should read the rows of before migration 3, with JSON tags, and count their size', () => {
+    const store = memoryStore()!
+    migrate(store, MIGRATIONS.slice(0, 2))
+    store.query('INSERT INTO targets (id, ending) VALUES (1, NULL)')
+    store.query(
+      `INSERT INTO history (target, msgid, time, command, source, account, bot, recipient, text, tags)
+       VALUES (1, ?, 0, 'PRIVMSG', 'a!b@c', NULL, 0, '#a', 'hello', ?)`,
+      '0'.repeat(26),
+      JSON.stringify({ '+a': 'x;y' })
+    )
+    migrate(store)
+    expect(store.query('SELECT size FROM history')).toEqual([
+      { size: 64 + 78 + 7 + 5 + 2 + 5 + 12 },
+    ])
+    const history = new History(store)
+    expect(history.page(1, 'ASC', '', '~', 10)[0].tags).toEqual({ '+a': 'x;y' })
+  })
+
   it('Should delete the history of the ordinary channels after a restart', () => {
     const store = serverStore()
     const history = new History(store)
@@ -710,6 +803,24 @@ describe('Query plans', () => {
         0,
         10
       ),
+      'the first channels of LIST': plan(
+        "SELECT folded, name, topic FROM channels WHERE instr(modes, 's') = 0 ORDER BY folded LIMIT ?",
+        10
+      ),
+      'the oldest rows of a target over its bytes': plan(
+        'SELECT id, msgid, size FROM history WHERE target = ? ORDER BY msgid LIMIT 512',
+        1
+      ),
+      'the oldest rows of the server over its bytes': plan(
+        'SELECT id FROM history WHERE id != ? ORDER BY id LIMIT ?',
+        1,
+        4
+      ),
+      'the bytes of a target, once': plan(
+        'SELECT count(*) AS n, coalesce(sum(size), 0) AS bytes FROM history WHERE target = ?',
+        1
+      ),
+      'the bytes of the server, once': plan('SELECT coalesce(sum(size), 0) AS bytes FROM history'),
     }
     console.log(
       Object.entries(plans)
@@ -718,9 +829,17 @@ describe('Query plans', () => {
     )
     for (const [name, detail] of Object.entries(plans)) {
       // The sweep reads the first rows of the table in the order of their ids, which is the order
-      // of the table itself, and stops at the limit.
+      // of the table itself, and stops at the limit. So does the budget of the server.
       if (name === 'the sweep of the oldest') {
         expect(detail).toBe('CO-ROUTINE (subquery-1); SCAN history; SCAN (subquery-1)')
+        continue
+      }
+      if (name === 'the oldest rows of the server over its bytes') {
+        expect(detail).toBe('SCAN history')
+        continue
+      }
+      if (name === 'the bytes of the server, once') {
+        expect(detail).toBe('SCAN history USING COVERING INDEX history_sizes')
         continue
       }
       expect(detail, name).toMatch(/USING (COVERING )?INDEX|USING (INTEGER )?PRIMARY KEY/)

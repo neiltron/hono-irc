@@ -92,7 +92,8 @@ export class Network extends DurableObject<Env> {
     // On Cloudflare, `CF-Connecting-IP` and the scheme of the URL are what the client used, and
     // `X-Forwarded-Proto` adds nothing to the URL. Under `cf dev`, both come from the headers of
     // the request, so a local client can claim any address and `https`.
-    void this.#server.connect(fromWebSocket(server, { protocol }), {
+    const { maxBufferedBytes } = this.#server
+    void this.#server.connect(fromWebSocket(server, { protocol, maxBufferedBytes }), {
       ip: request.headers.get('CF-Connecting-IP') ?? undefined,
       secure: new URL(request.url).protocol === 'https:',
     })

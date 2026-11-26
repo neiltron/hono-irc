@@ -28,6 +28,7 @@ import {
   isChannelName,
   msg,
   tooMany,
+  warn,
 } from '../state.ts'
 import type { Env, Line, Server } from '../state.ts'
 
@@ -54,9 +55,24 @@ export const channels = (server: Server) => {
 
     // The replies are rendered for each channel, so the client gets the JOIN of a channel
     // followed by its topic and names, before the next channel. The first key is for the first
-    // channel, and so on.
+    // channel, and so on. A channel is joined once, however many times it is listed, and the ones
+    // over TARGMAX are refused, so a JOIN does a bounded amount of work, such as restoring the
+    // permanent channels.
     const keys = keyList?.split(',') ?? []
-    for (const [i, channelName] of list.split(',').entries()) {
+    const seen = new Set<string>()
+    const targets: [name: string, key: string | undefined][] = []
+    const excess: string[] = []
+    for (const [i, name] of list.split(',').entries()) {
+      if (name && !seen.has(server.fold(name))) {
+        seen.add(server.fold(name))
+        if (targets.length < MAX_TARGETS.JOIN) {
+          targets.push([name, keys[i] || undefined])
+        } else {
+          excess.push(name)
+        }
+      }
+    }
+    for (const [channelName, key] of targets) {
       if (!isChannelName(channelName)) {
         c.render([ERR_NOSUCHCHANNEL, echo(channelName), 'No such channel'])
         continue
@@ -72,7 +88,7 @@ export const channels = (server: Server) => {
       }
       // A permanent channel that is empty is restored as it was, and its rules apply.
       const stored = channel ? undefined : server.restore(channelName)
-      const refused = (channel ?? stored)?.canJoin(client, keys[i] || undefined)
+      const refused = (channel ?? stored)?.canJoin(client, key)
       if (refused) {
         c.render(refused)
         continue
@@ -86,15 +102,20 @@ export const channels = (server: Server) => {
         }
         if (stored) {
           channel = stored
-          server.channelStore!.touch(folded)
+          server.safely(() => server.channelStore!.touch(folded))
         } else {
-          channel = new Channel(channelName)
-          // The account of the client founds the channel, which is permanent if it may be.
+          const created = new Channel(channelName)
+          channel = created
+          // The account of the client founds the channel, which is permanent if it may be, and
+          // can be stored.
           if (client.account !== undefined) {
-            channel.founder = server.fold(client.account)
-            if (server.persistChannels && server.channelStore?.allows(channel.founder)) {
-              server.setPermanent(channel, true)
-            }
+            const founder = server.fold(client.account)
+            created.founder = founder
+            server.safely(() => {
+              if (server.persistChannels && server.channelStore?.allows(founder)) {
+                server.setPermanent(created, true)
+              }
+            })
           }
         }
         server.channels.set(folded, channel)
@@ -124,14 +145,16 @@ export const channels = (server: Server) => {
       if (channel.topic) {
         c.render(...server.topic(channel))
       }
+      // What a feature adds, such as the read marker, can fail without stopping the JOIN.
       for (const hook of server.onJoin) {
-        hook(client, channel)
+        const joined = channel
+        server.safely(() => hook(client, joined))
       }
       if (!client.capabilities.has('no-implicit-names')) {
         c.render(...server.names(client, channel))
       }
     }
-    return c.render()
+    return c.render(...tooMany(excess))
   })
 
   app.on('TCP', '/PART/*', (c) => {
@@ -211,23 +234,56 @@ export const channels = (server: Server) => {
     )
   })
 
-  // The channels with members, and then the permanent channels that are empty, with 0 users. A
-  // secret channel is only listed to its members, so an empty one never is.
+  // The channels with members, the busiest first, and then the permanent channels that are empty,
+  // with 0 users, in the order of their names: at most `maxListEntries`. A secret channel is only
+  // listed to its members, so an empty one never is. A list that is cut is told before its end,
+  // with a WARN to a client that has standard-replies, and a NOTICE to the others.
   app.on('TCP', '/LIST/*', (c) => {
-    const empty = (server.channelStore?.listed() ?? []).filter(
-      ({ folded }) => !server.channels.has(folded)
-    )
+    const { client } = c.var
+    const max = server.maxListEntries
+    const live = [...server.channels.values()]
+      .filter((channel) => channel.visibleTo(client))
+      .sort((a, b) => b.members.size - a.members.size)
+    const entries = live
+      .slice(0, max)
+      .map((channel): Line => [
+        RPL_LIST,
+        channel.name,
+        channel.members.size,
+        channel.topic?.text ?? '',
+      ])
+    let truncated = live.length > max
+    const store = server.channelStore
+    if (store) {
+      // The permanent channels with members are among the first rows too, so as many more are
+      // read, and one more, to know whether the list goes on.
+      let permanent = 0
+      for (const channel of server.channels.values()) {
+        permanent += channel.permanent ? 1 : 0
+      }
+      const room = max - entries.length
+      if (room > 0) {
+        const rows = server.safely(() => store.listed(room + permanent + 1)) ?? []
+        const empty = rows.filter(({ folded }) => !server.channels.has(folded))
+        truncated ||= empty.length > room
+        entries.push(
+          ...empty.slice(0, room).map(({ name, topic }): Line => [RPL_LIST, name, 0, topic ?? ''])
+        )
+      } else {
+        truncated ||= store.count > permanent
+      }
+    }
+    const text = `The list is cut to ${max} channels`
     return c.render(
       [RPL_LISTSTART, 'Channel', 'Users  Name'],
-      ...[...server.channels.values()]
-        .filter((channel) => channel.visibleTo(c.var.client))
-        .map((channel): Line => [
-          RPL_LIST,
-          channel.name,
-          channel.members.size,
-          channel.topic?.text ?? '',
-        ]),
-      ...empty.map(({ name, topic }): Line => [RPL_LIST, name, 0, topic ?? '']),
+      ...entries,
+      ...(truncated
+        ? [
+            client.capabilities.has('standard-replies')
+              ? warn('LIST', 'TRUNCATED', text)
+              : (['NOTICE', client.nick, text] satisfies Line),
+          ]
+        : []),
       [RPL_LISTEND, 'End of /LIST']
     )
   })

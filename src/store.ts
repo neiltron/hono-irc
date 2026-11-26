@@ -189,6 +189,25 @@ export const MIGRATIONS: string[][] = [
       PRIMARY KEY (account, target)
     ) WITHOUT ROWID`,
   ],
+  [
+    // The size of each message, as the budgets of bytes count it (see `rowSize()` of
+    // `src/history.ts`, which is the same formula, with 64 for `ROW_OVERHEAD`). The client-only
+    // tags of the new rows are stored as on a line, not as JSON.
+    'ALTER TABLE history ADD COLUMN size INTEGER NOT NULL DEFAULT 0',
+    `UPDATE history SET size = 64 + 3 * length(CAST(msgid AS BLOB)) + length(CAST(command AS BLOB))
+      + length(CAST(source AS BLOB)) + coalesce(length(CAST(account AS BLOB)), 0)
+      + length(CAST(recipient AS BLOB)) + coalesce(length(CAST(text AS BLOB)), 0)
+      + coalesce(length(CAST(lines AS BLOB)), 0) + coalesce(length(CAST(tags AS BLOB)), 0)`,
+    // The msgid from which every member of a permanent channel reads its history: when it became
+    // permanent. NULL for a channel that was permanent from the start, or before this migration.
+    'ALTER TABLE channels ADD COLUMN since TEXT',
+    // The sizes of the messages of each target in their order, to free the bytes of a target
+    // without reading its rows, and to sum them once, and those of all, which are then kept in
+    // memory.
+    'CREATE INDEX history_sizes ON history (target, msgid, size)',
+    // The permanent channels that LIST shows, in the order of their names.
+    "CREATE INDEX channels_listed ON channels (folded) WHERE instr(modes, 's') = 0",
+  ],
 ]
 
 /**

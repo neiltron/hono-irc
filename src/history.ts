@@ -1,3 +1,4 @@
+import { byteLength, formatTagData, parseTags } from './protocol.ts'
 import type { Chat } from './state.ts'
 import type { Store } from './store.ts'
 
@@ -9,12 +10,25 @@ export type HistoryOptions = {
   maxAge?: number
   /** The messages kept on the server, all targets together. */
   maxRows?: number
+  /**
+   * The bytes of the messages kept for each target, and on the server, as `rowSize()` counts them:
+   * the newest messages that fit are kept.
+   */
+  maxTargetBytes?: number
+  maxBytes?: number
+  /**
+   * The max length in bytes of the client-only tags of a stored message, as on a line. The tags of
+   * a message are relayed whole, and stored only if they fit: the stored copy has none otherwise.
+   */
+  maxStoredTags?: number
+  /** The max number of targets that an account has read markers for. */
+  maxMarkers?: number
   /** The max number of messages of one `CHATHISTORY` request, the `CHATHISTORY` token. */
   limit?: number
 }
 
-/** The max number of targets that an account has read markers for. */
-export const MAX_MARKERS = 1000
+/** The max number of targets that an account has read markers for, by default. */
+export const MAX_MARKERS = 200
 
 const DAY = 86_400_000
 
@@ -56,6 +70,44 @@ const PRUNE = 2
 const SWEEP = 1000
 /** The targets that have ended that one `sweep()` may look at. */
 const SWEEP_TARGETS = 100
+/**
+ * The oldest rows that one message may delete to get its target, or the server, back under its
+ * budget of bytes. A row has at most about 30 KB, and at least `ROW_OVERHEAD` bytes, so this frees
+ * the size of any one message.
+ */
+const PRUNE_ROWS = 512
+
+/**
+ * What a row takes beyond the bytes of its text columns, about: its integers, and the headers of
+ * the record and of its entries in the two indexes, whose msgids are counted with the columns.
+ * Migration 3 counts the rows that were stored before it with the same formula, in SQL.
+ */
+export const ROW_OVERHEAD = 64
+
+/**
+ * The size of a row as the budgets count it: the bytes of its text columns, the msgid twice more,
+ * for the indexes `(target, msgid)` and `(target, msgid, size)`, and `ROW_OVERHEAD`. It is stored
+ * with the row.
+ */
+export const rowSize = (columns: {
+  msgid: string
+  command: string
+  source: string
+  account: string | null
+  recipient: string
+  text: string | null
+  lines: string | null
+  tags: string | null
+}) =>
+  ROW_OVERHEAD +
+  3 * byteLength(columns.msgid) +
+  byteLength(columns.command) +
+  byteLength(columns.source) +
+  byteLength(columns.account ?? '') +
+  byteLength(columns.recipient) +
+  byteLength(columns.text ?? '') +
+  byteLength(columns.lines ?? '') +
+  byteLength(columns.tags ?? '')
 
 type Row = {
   id: number
@@ -74,6 +126,15 @@ type Row = {
 
 const COLUMNS = 'msgid, time, command, source, account, bot, recipient, text, lines, tags'
 
+// The client-only tags are stored as on a line (`+a=1;+b`), and were stored as JSON before
+// migration 3, which a key, starting with `+`, tells apart.
+const readTags = (tags: string | null): Record<string, string> =>
+  tags === null
+    ? {}
+    : tags[0] === '{'
+      ? (JSON.parse(tags) as Record<string, string>)
+      : parseTags(tags)
+
 const toChat = (row: Row): Chat => ({
   msgid: row.msgid,
   time: row.time,
@@ -84,8 +145,11 @@ const toChat = (row: Row): Chat => ({
   target: row.recipient,
   ...(row.text !== null && { text: row.text }),
   ...(row.lines !== null && { lines: JSON.parse(row.lines) as Chat['lines'] }),
-  tags: row.tags === null ? {} : (JSON.parse(row.tags) as Record<string, string>),
+  tags: readTags(row.tags),
 })
+
+/** What a deletion returns, to keep the counts and the bytes. */
+type Deleted = { target: number; size: number }
 
 /**
  * The stored messages (draft/chathistory) and read markers (draft/read-marker). Every method is
@@ -103,11 +167,18 @@ export class History {
   maxAge: number
   maxRows: number
   limit: number
+  maxTargetBytes: number
+  maxBytes: number
+  maxStoredTags: number
+  maxMarkers: number
   /**
-   * The number of messages of each target that has been written to since the start, counted once
-   * from the index and then kept up to date, so that a message does not count its target again.
+   * The number of messages and their bytes, of each target that has been written to since the
+   * start, counted once from the index and then kept up to date, so that a message does not count
+   * its target again.
    */
-  #counts = new Map<number, number>()
+  #counts = new Map<number, { count: number; bytes: number }>()
+  /** The bytes of all the messages, counted once when a message is first stored. */
+  #total?: number
 
   constructor(store: Store, options: HistoryOptions = {}) {
     this.store = store
@@ -115,6 +186,10 @@ export class History {
     this.maxAge = options.maxAge ?? 90 * DAY
     this.maxRows = options.maxRows ?? 2_000_000
     this.limit = options.limit ?? 100
+    this.maxTargetBytes = options.maxTargetBytes ?? 16 * 1024 * 1024
+    this.maxBytes = options.maxBytes ?? 1024 * 1024 * 1024
+    this.maxStoredTags = options.maxStoredTags ?? 1024
+    this.maxMarkers = options.maxMarkers ?? MAX_MARKERS
     // The ordinary channels have not survived the restart, so their histories go.
     store.query('UPDATE targets SET ending = 1 WHERE ending = 0')
   }
@@ -167,24 +242,87 @@ export class History {
     ].map(({ id, peer }) => ({ target: id, peer }))
   }
 
-  #count(target: number): number {
-    let count = this.#counts.get(target)
-    if (count === undefined) {
-      count = this.store.query<{ n: number }>(
-        'SELECT count(*) AS n FROM history WHERE target = ?',
+  #count(target: number): { count: number; bytes: number } {
+    let counted = this.#counts.get(target)
+    if (counted === undefined) {
+      const [{ n, bytes }] = this.store.query<{ n: number; bytes: number }>(
+        'SELECT count(*) AS n, coalesce(sum(size), 0) AS bytes FROM history WHERE target = ?',
         target
-      )[0].n
-      this.#counts.set(target, count)
+      )
+      counted = { count: n, bytes }
+      this.#counts.set(target, counted)
     }
-    return count
+    return counted
   }
 
-  /** Forget the rows that were deleted, for the counts. */
-  #deleted(rows: { target: number }[]) {
-    for (const { target } of rows) {
-      const count = this.#counts.get(target)
-      if (count !== undefined) {
-        this.#counts.set(target, count - 1)
+  #totalBytes(): number {
+    this.#total ??= this.store.query<{ bytes: number }>(
+      'SELECT coalesce(sum(size), 0) AS bytes FROM history'
+    )[0].bytes
+    return this.#total
+  }
+
+  /** Forget the rows that were deleted, for the counts and the bytes. */
+  #deleted(rows: Deleted[]) {
+    for (const { target, size } of rows) {
+      const counted = this.#counts.get(target)
+      if (counted !== undefined) {
+        counted.count--
+        counted.bytes -= size
+      }
+      if (this.#total !== undefined) {
+        this.#total -= size
+      }
+    }
+  }
+
+  /**
+   * Delete the oldest rows of a target until `bytes` are freed: the shortest run of them that does,
+   * of at most `PRUNE_ROWS`, found with the sizes in the index `history_sizes`, so that only the
+   * rows that are deleted are read.
+   */
+  #freeTarget(target: number, bytes: number) {
+    this.#deleted(
+      this.store.query<Deleted>(
+        `DELETE FROM history WHERE id IN (
+           SELECT id FROM (
+             SELECT id, sum(size) OVER (ORDER BY msgid ROWS UNBOUNDED PRECEDING) - size AS earlier
+             FROM (
+               SELECT id, msgid, size FROM history WHERE target = ? ORDER BY msgid LIMIT ${PRUNE_ROWS}
+             )
+           ) WHERE earlier < ?
+         ) RETURNING target, size`,
+        target,
+        bytes
+      )
+    )
+  }
+
+  /**
+   * Delete the oldest rows of the server, but `keep`, until `bytes` are freed, and at most
+   * `PRUNE_ROWS`: one row, then twice as many each time, as no index has the sizes in the order of
+   * storage. So a few statements free a large message, and at most about twice the rows that it
+   * takes are deleted.
+   */
+  #freeServer(bytes: number, keep: number) {
+    let freed = 0
+    let deleted = 0
+    for (let limit = 1; freed < bytes && deleted < PRUNE_ROWS; limit *= 2) {
+      const count = Math.min(limit, PRUNE_ROWS - deleted)
+      const rows = this.store.query<Deleted>(
+        `DELETE FROM history WHERE id IN (
+           SELECT id FROM history WHERE id != ? ORDER BY id LIMIT ?
+         ) RETURNING target, size`,
+        keep,
+        count
+      )
+      this.#deleted(rows)
+      for (const { size } of rows) {
+        freed += size
+      }
+      deleted += rows.length
+      if (rows.length < count) {
+        break
       }
     }
   }
@@ -194,43 +332,78 @@ export class History {
    * oldest rows over `maxMessages`, a few of those older than `maxAge`, and a few over `maxRows`.
    */
   add(target: number, chat: Chat, now = Date.now()) {
+    const data = formatTagData(chat.tags)
+    const columns = {
+      msgid: chat.msgid,
+      command: chat.command,
+      source: chat.source,
+      account: chat.account ?? null,
+      recipient: chat.target,
+      text: chat.text ?? null,
+      lines: chat.lines ? JSON.stringify(chat.lines) : null,
+      // The tags that do not fit are relayed, but not stored.
+      tags: data && byteLength(data) <= this.maxStoredTags ? data : null,
+    }
+    const size = rowSize(columns)
+    try {
+      this.#add(target, chat, columns, size, now)
+    } catch (error) {
+      // What was counted of a write that was rolled back is counted again.
+      this.#counts.delete(target)
+      this.#total = undefined
+      throw error
+    }
+  }
+
+  #add(
+    target: number,
+    chat: Chat,
+    columns: Parameters<typeof rowSize>[0],
+    size: number,
+    now: number
+  ) {
     this.store.transaction(() => {
-      const count = this.#count(target)
+      const counted = this.#count(target)
+      const count = counted.count
+      this.#totalBytes()
       const [{ id }] = this.store.query<{ id: number }>(
-        `INSERT INTO history (target, ${COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         RETURNING id`,
+        `INSERT INTO history (target, ${COLUMNS}, size)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
         target,
-        chat.msgid,
+        columns.msgid,
         chat.time,
-        chat.command,
-        chat.source,
-        chat.account ?? null,
+        columns.command,
+        columns.source,
+        columns.account,
         chat.bot ? 1 : 0,
-        chat.target,
-        chat.text ?? null,
-        chat.lines ? JSON.stringify(chat.lines) : null,
-        Object.keys(chat.tags).length ? JSON.stringify(chat.tags) : null
+        columns.recipient,
+        columns.text,
+        columns.lines,
+        columns.tags,
+        size
       )
-      this.#counts.set(target, count + 1)
+      counted.count++
+      counted.bytes += size
+      this.#total! += size
       // The oldest of the target over the limit, and a few of those that are too old. A target
       // can be far over the limit after it is lowered: it gets back under it a few rows at a time.
       const excess = Math.min(count + 1 - this.maxMessages, PRUNE + 1)
       if (excess > 0) {
         this.#deleted(
-          this.store.query<{ target: number }>(
+          this.store.query<Deleted>(
             `DELETE FROM history WHERE id IN (
                SELECT id FROM history WHERE target = ? ORDER BY msgid LIMIT ?
-             ) RETURNING target`,
+             ) RETURNING target, size`,
             target,
             excess
           )
         )
       }
       this.#deleted(
-        this.store.query<{ target: number }>(
+        this.store.query<Deleted>(
           `DELETE FROM history WHERE id IN (
              SELECT id FROM history WHERE target = ? AND msgid < ? ORDER BY msgid LIMIT ?
-           ) RETURNING target`,
+           ) RETURNING target, size`,
           target,
           // The time of a message is the one of its msgid, so this is a range of the index.
           encodeTime(now - this.maxAge),
@@ -240,14 +413,22 @@ export class History {
       // The server keeps the last `maxRows` rows it stored, at most.
       if (id > this.maxRows) {
         this.#deleted(
-          this.store.query<{ target: number }>(
+          this.store.query<Deleted>(
             `DELETE FROM history WHERE id IN (
              SELECT id FROM history WHERE id <= ? ORDER BY id LIMIT ?
-           ) RETURNING target`,
+           ) RETURNING target, size`,
             id - this.maxRows,
             PRUNE
           )
         )
+      }
+      // The budgets of bytes, of the target and of the server: the oldest rows go, as many as it
+      // takes to free what is over, up to `PRUNE_ROWS`, so a message frees at least its own size.
+      if (counted.bytes > this.maxTargetBytes) {
+        this.#freeTarget(target, counted.bytes - this.maxTargetBytes)
+      }
+      if (this.#total! > this.maxBytes) {
+        this.#freeServer(this.#total! - this.maxBytes, id)
       }
     })
   }
@@ -290,13 +471,14 @@ export class History {
       if (!doomed) {
         break
       }
-      const rows = this.store.query(
+      const rows = this.store.query<Deleted>(
         `DELETE FROM history WHERE id IN (SELECT id FROM history WHERE target = ? LIMIT ?)
-         RETURNING id`,
+         RETURNING target, size`,
         doomed.id,
         budget - deleted
-      ).length
-      deleted += rows
+      )
+      this.#deleted(rows)
+      deleted += rows.length
       if (deleted < budget) {
         this.store.query('DELETE FROM targets WHERE id = ?', doomed.id)
       }
@@ -304,10 +486,10 @@ export class History {
     if (deleted < budget) {
       // The rows are in the order of storage, which is the order of time but for a clock that went
       // back, so the oldest are among the first.
-      const rows = this.store.query<{ target: number }>(
+      const rows = this.store.query<Deleted>(
         `DELETE FROM history WHERE id IN (
            SELECT id FROM (SELECT id, time FROM history ORDER BY id LIMIT ?) WHERE time < ?
-         ) RETURNING target`,
+         ) RETURNING target, size`,
         budget - deleted,
         now - this.maxAge
       )
@@ -347,7 +529,7 @@ export class History {
           'SELECT count(*) AS n FROM read_markers WHERE account = ?',
           account
         )
-        if (n >= MAX_MARKERS) {
+        if (n >= this.maxMarkers) {
           return undefined
         }
       }

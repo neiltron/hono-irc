@@ -158,7 +158,7 @@ await step('registration and ISUPPORT', async () => {
   assert.ok(alice.network.cap.enabled.includes('cap-notify'))
   assert.equal(
     alice.network.supports('TARGMAX'),
-    'PRIVMSG:4,NOTICE:4,TAGMSG:4,KICK:4,NAMES:1,WHO:1,WHOIS:1'
+    'PRIVMSG:4,NOTICE:4,TAGMSG:4,KICK:4,NAMES:1,WHO:1,WHOIS:1,JOIN:10'
   )
   // irc-framework asks for message-tags and batch itself, and alice for labeled-response.
   for (const cap of ['message-tags', 'batch', 'labeled-response']) {

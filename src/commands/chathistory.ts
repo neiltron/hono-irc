@@ -287,7 +287,7 @@ export const chathistory = (server: Server) => {
 
     // The database may fail: the client is told that nothing can be retrieved.
     const failed = (error: unknown) => {
-      console.error(error)
+      server.report(error)
       return c.render(
         fail(
           'CHATHISTORY',

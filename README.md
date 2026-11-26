@@ -126,13 +126,15 @@ The dependency is pinned to a commit, and pnpm builds it on install. To update i
   - Bot mode: `BOT=B`, `RPL_WHOISBOT` (335) in `WHOIS`, `B` in the flags of `WHO`, and the `bot` tag, for the clients with `message-tags`, on every message whose source is a client in bot mode, including the lines of its multiline batches.
 - `CASEMAPPING=ascii`. The lengths of `NICKLEN`, `CHANNELLEN`, `TOPICLEN`, `AWAYLEN`, `KICKLEN`, `KEYLEN`, and `NAMELEN` are in bytes.
 - Lines: a client can send 4096 bytes of tags and 512 bytes of the rest. A longer line gets `ERR_INPUTTOOLONG` and is dropped. A line from the server is at most 512 bytes without the tags: a longer last parameter is cut. The tags that the server adds come first and are far below their 4094 bytes, and the relayed client-only tags are at most 4094 bytes, so a line has at most 8191 bytes of tags.
-- Targets: `PRIVMSG`, `NOTICE`, `TAGMSG`, and `KICK` take up to four, and `NAMES`, `WHO`, and `WHOIS` one, as `TARGMAX` shows. A repeated target counts once.
+- Targets: `PRIVMSG`, `NOTICE`, `TAGMSG`, and `KICK` take up to four, `JOIN` ten, and `NAMES`, `WHO`, and `WHOIS` one, as `TARGMAX` shows. A repeated target counts once (in any case), and the ones over the limit get `ERR_TOOMANYTARGETS`.
 - The address of the client is passed to the server, from `CF-Connecting-IP` for a WebSocket and from the Worker for TCP (see below). It is not shown to the other users, who see a cloak (see below).
 - A client that does not answer a `PING` is disconnected, and so is one that has not registered in time after it connected.
 - Limits, set with the options of `createServer()`:
-  - `flood`: a token bucket for each connection, by default 10 commands at once and one more every 2 seconds, with `NICK`, `JOIN`, `PART`, `AUTHENTICATE`, `CHATHISTORY` (2), and `REGISTER` (3) taking more. `AUTHENTICATE` and `REGISTER`, which hash a password, take their cost before the registration too. A client that runs out is not disconnected: its commands wait until the tokens are back (fake lag), so a burst is handled in full and in order, only slower. The others are not slowed down. `false` turns it off. The lines of a multiline batch are free, and the batch takes one token for every 512 bytes or every 5 lines, whichever is more, when it ends.
+  - `flood`: a token bucket for each connection, by default 10 commands at once and one more every 2 seconds, with `NICK`, `JOIN`, `PART`, `AUTHENTICATE`, `CHATHISTORY` (2), and `REGISTER` (3) taking more. `AUTHENTICATE` and `REGISTER`, which hash a password, take their cost before the registration too. A client that runs out is not disconnected: its commands wait until the tokens are back (fake lag), so a burst is handled in full and in order, only slower. The others are not slowed down. `false` turns it off. The lines of a multiline batch are free when they come, and the batch takes one token for every 512 bytes of its lines as they came (tags included) or every 5 lines, whichever is more, when it ends: when it closes, and also when it fails or times out, so a batch that fails is not free.
   - `multiline`: `maxBytes` (4096), `maxLines` (100), and `timeout` (30 seconds) of a `draft/multiline` batch.
-  - `maxConnections` (1000), `maxConnectionsPerIp` (10, when the runtime knows the address), and `maxChannels` (1000).
+  - `maxConnections` (1000), `maxConnectionsPerIp` (10, for an IPv4 address or an IPv6 /64, when the runtime knows the address), `maxConnectionsPerNetwork` (20, for an IPv6 /48), `connectionRate` (10 new connections at once from an address, as `maxConnectionsPerIp` counts it, and one more every 6 seconds, so that reconnecting does not buy a fresh flood control), and `maxChannels` (1000). A connection over a limit gets an `ERROR` and is closed.
+  - `maxListEntries` (500): `LIST` shows the channels with members, the busiest first, and then the empty permanent channels, by name, up to this many. A list that is cut says so before `RPL_LISTEND`: `WARN LIST TRUNCATED` to a client with `standard-replies`, and a `NOTICE` to the others, as no spec defines a reply for it, and every client shows a notice.
+  - `maxReplyBytes` (512 KiB) and `maxBufferedBytes` (1 MiB): see [Memory](#memory).
   - `accounts`: see [Accounts](#accounts).
   - `persistChannels`, `permanentChannels`, `history`, and `replayOnJoin`: see [History and permanent channels](#history-and-permanent-channels).
 
@@ -145,7 +147,7 @@ The dependency is pinned to a commit, and pnpm builds it on install. To update i
 - `draft/event-playback`: only `PRIVMSG` and `NOTICE` are stored (see [History and permanent channels](#history-and-permanent-channels)).
 - The WebSocket transport on Node.js, which has no WebSocket server built in. `src/websocket.ts` does not depend on a runtime.
 - The other IRCv3 extensions, such as `chghost`, `STATUSMSG`, and the `draft/chathistory-context` messages. No standard reply is sent beyond what a spec defines, so `standard-replies` changes nothing yet.
-- `ELIST`, and the parameters of `LIST`. `WHO` with a mask that is not a channel or a nickname. `KNOCK`.
+- `ELIST`, and the parameters of `LIST`, so a client can not ask for the channels past `maxListEntries`. `WHO` with a mask that is not a channel or a nickname. `KNOCK`.
 
 ## Accounts
 
@@ -167,7 +169,9 @@ A client registers an account with `REGISTER` (`draft/account-registration`) and
 - On Cloudflare Workers, the SQLite database of the Durable Object, with `ctx.storage.sql.exec()` and `ctx.storage.transactionSync()`. It is in the storage of the object, so the accounts survive restarts and deploys. Under `cf dev`, it is in `.cloudflare/state`.
 - On Node.js, `node:sqlite` (`DatabaseSync`), in the file of `DATABASE`, or in memory without it. `createServer()` without `database` uses an in-memory database where the runtime has `node:sqlite`, which is loaded with `process.getBuiltinModule()`, so the bundle of the Worker does not import it.
 
-The schema is a list of migrations, each applied once in a transaction, at startup. A database whose schema is newer than the server is refused. The writes of an account are one transaction. Migration 2 adds the permanent channels, the history, and the read markers.
+The schema is a list of migrations, each applied once in a transaction, at startup. A database whose schema is newer than the server is refused. The writes of an account are one transaction. Migration 2 adds the permanent channels, the history, and the read markers. Migration 3 adds the size of each message (counted for the rows already stored), the index of the sizes, the boundary of the history of a permanent channel (`since`), and the index of `LIST`.
+
+A failure of the database never stops the server, nor leaves the clients and the memory apart: a write that the state depends on, such as making a channel permanent or registering an account, is done before the state changes, and its failure is told to the client (`ERR_UNKNOWNERROR` for `MODE +P`, `TEMPORARILY_UNAVAILABLE` for `REGISTER`, `INTERNAL_ERROR` for `MARKREAD`); one that it does not, such as storing a message or the state of a permanent channel after a change, is skipped, and the server goes on from memory: the message is delivered, the change is made and told, and a `JOIN` completes. The failures are logged once a minute at most, with the number of the others (`Server.safely()`).
 
 ## History and permanent channels
 
@@ -206,7 +210,10 @@ Set with `history` of `createServer()`, and enforced a little at a time, so that
 - `maxMessages` (10,000): the newest messages of each target. Each new message deletes the oldest of its target over the limit (at most 3 at a time, if the limit was lowered).
 - `maxAge` (90 days): each new message deletes up to 2 messages of its target that are older, and `tick()` up to 1,000 of the oldest of the server.
 - `maxRows` (2,000,000): the server keeps at most the last `maxRows` messages it stored; each new message deletes up to 2 that are older than that.
-- The counts of the messages of a target are read once from the index, and then kept in memory.
+- `maxTargetBytes` (16 MiB) and `maxBytes` (1 GiB): the bytes of the messages of each target, and of the server, as the column `size` of each row counts them (its text columns, its msgid three times, for the row and the two indexes, and 64 bytes for the rest). Each new message deletes the oldest of its target, or of the server, until they are back under the budget, at most 512 rows; so a message always frees at least its own size, as no row has more than about 30 KB. The oldest of a target are found with their sizes in the index `(target, msgid, size)`, without reading the rows, and those of the server one, then two, then four rows at a time, so a few more than it takes may go.
+- `maxStoredTags` (1,024): the client-only tags of a message are stored as on a line, `+a=1;+b`, only if they take at most this many bytes. They are relayed whole, and a message that is played back has no client-only tags if they did not fit.
+- `maxMarkers` (200): the read markers of an account.
+- The counts and the bytes of the messages of a target are read once from the index of the sizes, as are the bytes of the whole server when it first stores a message, and then kept in memory.
 
 #### What is stored about the users
 
@@ -214,11 +221,19 @@ The mask (`nick!user@cloak`, never the address) and the account of the sender of
 
 #### The cost
 
-One message is one row of `history` and one entry of its index, `(target, msgid)`: 2 rows written on a Durable Object, plus the 2 to delete when a target is full. The first message of a channel or of a pair of accounts also writes a row of `targets`. A multiline message at the largest size that the capability advertises (4,096 bytes in 100 lines, with 4,094 bytes of client-only tags) takes at most about 60 KB in JSON, even with control characters, far below the limit of 2 MB of a row. At 2,000,000 rows, the history takes about 1 GB of the 10 GB of a Durable Object.
+One message is one row of `history` and one entry in each of its two indexes, `(target, msgid)` and `(target, msgid, size)`: 3 rows written on a Durable Object, plus about as many to delete when a budget is full. The first message of a channel or of a pair of accounts also writes a row of `targets`. A message of one line takes at most about 1.8 KB (510 bytes of text, 1,024 of tags, the mask, and the msgid), and a multiline message at the largest size that the capability advertises (4,096 bytes in 100 lines) at most about 30 KB, with JSON that takes 6 bytes for a control character: far below the limit of 2 MB of a row.
+
+The largest database, in the worst case, with the default limits, is well under the 10 GB of a Durable Object:
+
+- The history: at most `maxBytes`, 1 GiB, as `size` counts it, which a database file measured at 1.05 to 1.26 times that, with rows of all sizes. Say 1.5 GiB. `maxRows` alone would not bound it: 2,000,000 rows of 30 KB are 60 GB.
+- The read markers: `maxAccounts` × `maxMarkers` rows of about 100 bytes (two names and a time), 100,000 × 200 × 100 B = 2 GB.
+- The permanent channels: 10,000 rows with lists of 100 masks of 100 bytes, with who set them, about 25 KB each, 250 MB.
+- The accounts: 100,000 rows of about 200 bytes, 20 MB, and the registrations of the last hour, fewer.
+- About 4 GB in all. A client without an account writes only the messages to channels, which `maxBytes` bounds, so the rest needs accounts, which `maxPerAddress` and `maxAccounts` limit.
 
 ### draft/read-marker
 
-[`MARKREAD`](https://ircv3.net/specs/extensions/read-marker): a marker belongs to an account, for a channel that exists or for the direct messages with another account, is stored as one row, only moves forward (not past the time of the server), and is sent to the other connections of the account with the capability when it moves, and on `JOIN`, before `RPL_ENDOFNAMES`. A client that is not logged in gets `*`, and setting a marker fails with `INTERNAL_ERROR`. An account has at most 1,000 markers. The errors are `NEED_MORE_PARAMS`, `INVALID_PARAMS`, and `INTERNAL_ERROR`.
+[`MARKREAD`](https://ircv3.net/specs/extensions/read-marker): a marker belongs to an account, for a channel that exists or for the direct messages with another account, is stored as one row, only moves forward (not past the time of the server), and is sent to the other connections of the account with the capability when it moves, and on `JOIN`, before `RPL_ENDOFNAMES`. A client that is not logged in gets `*`, and setting a marker fails with `INTERNAL_ERROR`. An account has at most `history.maxMarkers` (200) markers. A secret channel that the client is not in is answered as one that does not exist. The errors are `NEED_MORE_PARAMS`, `INVALID_PARAMS`, and `INTERNAL_ERROR`.
 
 ### replayOnJoin
 
@@ -241,6 +256,17 @@ The other users see a cloak in place of the address: `<address>.<network>.<wider
 - The hash is in plain JavaScript (`src/cloak.ts`), because a client is made synchronously when it connects, and the digests of WebCrypto are asynchronous. The tests compare it with `node:crypto`.
 - The Durable Object makes the key once and keeps it in its storage, with the synchronous KV API of SQLite-backed objects, so the cloaks stay the same across restarts and deploys. On Node.js, the key is random for each process unless `cloakSecret` is given.
 - A client whose address is unknown gets a random host, `<random>.user`, which changes on each connection.
+
+## Memory
+
+A Durable Object has 128 MB of memory, which all the connections share. What a connection holds, beyond its state, is what waits to be sent to it:
+
+- The messages pushed to it, up to `maxBufferedBytes` (1 MiB), which `createServer()` gives to tcp-hono for TCP, and to `fromWebSocket()` for a WebSocket. A client that does not read is disconnected beyond it.
+- The response to its command, which is written whole and waits for the client to read it, outside `maxBufferedBytes`. So it is bounded by `maxReplyBytes` (512 KiB): a longer one is not sent, and the client gets `ERROR :Closing Link: <host> (Reply too long)` and is disconnected, as it is a bug or abuse. The largest replies are bounded below it: `LIST` by `maxListEntries` (500 entries of at most about 450 bytes, 225 KB), a `CHATHISTORY` reply at about 256 KiB, and `WHO` of a channel by its members.
+
+So one address, as `maxConnectionsPerIp` counts it, holds at most 10 × (1 MiB + 512 KiB) = 15 MiB, and one IPv6 /48 at most 20 × 1.5 MiB = 30 MiB: a 128 MB object survives one of them. Measured on Node.js, 50 TCP clients that send `LIST` (500 entries, 213 KB) and never read add 12 MB to the heap after a garbage collection (and 81 MB to the RSS), where 10,000 permanent channels, before `maxListEntries`, added 709 MB.
+
+What remains: `maxConnections` (1,000) × 1.5 MiB is 1.5 GiB, so many addresses together can still exhaust the object. Lower limits shrink it (`maxBufferedBytes` and `maxReplyBytes` of 256 KiB make it 500 MB), but only a budget of the bytes waiting for all the connections together bounds it, and that needs tcp-hono to expose how many bytes a connection has queued (`bufferedBytes`), which it does not yet. That is future work.
 
 ## Deploying
 

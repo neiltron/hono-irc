@@ -22,7 +22,7 @@ const value = (at?: number) => (at === undefined ? '*' : PREFIX + new Date(at).t
  *   no marker: it gets `*`, and setting one fails with `INTERNAL_ERROR`.
  * - A client with the capability gets the marker of a channel when it joins, before the names.
  * - A target must exist, a channel or an account, so an account has at most a marker for each, and
- *   `MAX_MARKERS` in all.
+ *   `history.maxMarkers` in all.
  */
 export const markread = (server: Server) => {
   const app = new Hono<Env>()
@@ -78,12 +78,7 @@ export const markread = (server: Server) => {
       )
     }
     const account = server.fold(client.account)
-    let marked: { at: number; moved: boolean } | undefined
-    try {
-      marked = history.mark(account, folded, Math.min(at, Date.now()))
-    } catch (error) {
-      console.error(error)
-    }
+    const marked = server.safely(() => history.mark(account, folded, Math.min(at, Date.now())))
     if (!marked) {
       return c.render(
         fail('MARKREAD', 'INTERNAL_ERROR', echo(target), 'The read timestamp could not be set')

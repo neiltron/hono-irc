@@ -10,6 +10,7 @@ import {
   ERR_NOTONCHANNEL,
   ERR_TOOMANYCHANNELS,
   ERR_UMODEUNKNOWNFLAG,
+  ERR_UNKNOWNERROR,
   ERR_UNKNOWNMODE,
   ERR_USERNOTINCHANNEL,
   ERR_USERSDONTMATCH,
@@ -220,11 +221,26 @@ export const modes = (server: Server) => {
         } else if (!server.founds(client, channel)) {
           lines.push([ERR_CHANOPRIVSNEEDED, channel.name, "You're not the channel founder"])
         } else if (channel.permanent !== adding) {
-          if (adding && !server.channelStore!.allows(channel.founder!)) {
+          const allowed = server.safely(
+            () => !adding || server.channelStore!.allows(channel.founder!)
+          )
+          if (allowed === false) {
             lines.push([ERR_TOOMANYCHANNELS, channel.name, 'Too many permanent channels'])
-          } else {
-            server.setPermanent(channel, adding)
+          } else if (
+            allowed &&
+            server.safely(() => {
+              server.setPermanent(channel, adding)
+              return true
+            })
+          ) {
             changes.push({ adding, mode })
+          } else {
+            // The database failed: the channel is as it was.
+            lines.push([
+              ERR_UNKNOWNERROR,
+              'MODE',
+              'The channel could not be stored, try again later',
+            ])
           }
         }
         continue

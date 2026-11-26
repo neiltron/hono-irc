@@ -29,7 +29,7 @@ import {
   ERR_SASLABORTED,
   RPL_LOGGEDIN,
 } from './numerics.ts'
-import { Accounts } from './accounts.ts'
+import { Accounts, Throttle } from './accounts.ts'
 import type { AccountOptions } from './accounts.ts'
 import { ChannelStore } from './channels-store.ts'
 import type { PermanentOptions, StoredEntry } from './channels-store.ts'
@@ -63,6 +63,8 @@ export type Env = {
   Variables: {
     client: Client
     message: IRCMessage
+    /** The length of the line in bytes, as it came, without the line terminator. */
+    size: number
     /** What the prepare step of the command made, if it has one. See `Server.prepare`. */
     prepared: unknown
   }
@@ -88,8 +90,30 @@ export type ServerOptions = {
   flood?: FloodOptions | false
   /** The max number of connections. A connection over it is refused. */
   maxConnections?: number
-  /** The max number of connections from one address, when the runtime knows the address. */
+  /**
+   * The max number of connections from one address, when the runtime knows the address: an IPv4
+   * address, or an IPv6 /64, as one host often has a whole /64.
+   */
   maxConnectionsPerIp?: number
+  /** The max number of connections from one IPv6 /48. */
+  maxConnectionsPerNetwork?: number
+  /**
+   * The new connections from one address (as `maxConnectionsPerIp` counts them): `burst` at once,
+   * and one more every `interval` milliseconds. So reconnecting does not buy fresh flood control.
+   */
+  connectionRate?: { burst?: number; interval?: number }
+  /**
+   * The max number of bytes queued for a connection, which is closed beyond it: the messages
+   * pushed to a client that does not read, `maxBufferedBytes` of tcp-hono and of the WebSocket.
+   */
+  maxBufferedBytes?: number
+  /**
+   * The max length in bytes of the response to one command. A longer one is not sent: the client
+   * gets an ERROR and is disconnected, as it is a bug or abuse.
+   */
+  maxReplyBytes?: number
+  /** The max number of channels in a reply to LIST. */
+  maxListEntries?: number
   /** The max number of channels on the server. */
   maxChannels?: number
   /** The limits of a `draft/multiline` batch from a client. */
@@ -172,6 +196,7 @@ export const MAX_TARGETS = {
   NAMES: 1,
   WHO: 1,
   WHOIS: 1,
+  JOIN: 10,
 }
 /** The max length of a channel key, `KEYLEN`. */
 export const KEY_LENGTH = 23
@@ -329,7 +354,13 @@ export type InboundBatch = {
   /** The client-only tags of the `BATCH +` line, which are relayed with the message. */
   tags: Record<string, string>
   opened: number
+  /** The lines that the batch has received, valid or not, and their bytes as they came. */
+  received: number
+  raw: number
 }
+
+/** The token bucket of the flood control of a client (see `src/flood.ts`). */
+export type Bucket = { tokens: number; at: number; registered: boolean }
 
 export class Client {
   nick = '*'
@@ -361,6 +392,8 @@ export class Client {
   pinged = false
   /** Whether a command of the client waits for the flood control. */
   delayed = false
+  /** The tokens of the flood control. See `Server.charge()`. */
+  bucket?: Bucket
   /** The version of `CAP LS`, e.g. 302, or 0 if the client has not sent one with a version. */
   capVersion = 0
   /** User mode `B`: the client is a bot. */
@@ -537,6 +570,12 @@ export class Channel {
    * is not permanent, a member reads the history from there on.
    */
   joined = new Map<Client, string>()
+  /**
+   * The msgid made when the channel became permanent, if it had messages then, from which every
+   * member reads its history; `undefined` for all of it. A message from before is read only by the
+   * members that have joined since, as in a channel that is not permanent.
+   */
+  since?: string
 
   /** Whether the channel is permanent (+P): it is stored, and stays when it is empty. */
   get permanent() {
@@ -625,6 +664,12 @@ export class Server {
   flood: Required<FloodOptions> | false
   maxConnections: number
   maxConnectionsPerIp: number
+  maxConnectionsPerNetwork: number
+  maxBufferedBytes: number
+  maxReplyBytes: number
+  maxListEntries: number
+  /** The new connections of each address. See `connectionRate` of `ServerOptions`. */
+  connectionRate: Throttle
   maxChannels: number
   multiline: Required<MultilineOptions>
   cloakSecret: string
@@ -635,8 +680,12 @@ export class Server {
   nicks = new Map<string, Client>()
   /** By the folded channel name. */
   channels = new Map<string, Channel>()
-  /** The number of connections from each address that the runtime told. */
+  /**
+   * The number of connections from each address that the runtime told, by `addressKey()`, and from
+   * each IPv6 /48.
+   */
   addresses = new Map<string, number>()
+  networks = new Map<string, number>()
   /**
    * The clients that monitor a nickname, by the folded nickname.
    * `Client.monitoring` is the other side.
@@ -741,6 +790,14 @@ export class Server {
           }
     this.maxConnections = config.maxConnections ?? 1000
     this.maxConnectionsPerIp = config.maxConnectionsPerIp ?? 10
+    this.maxConnectionsPerNetwork = config.maxConnectionsPerNetwork ?? 20
+    this.connectionRate = new Throttle(
+      config.connectionRate?.burst ?? 10,
+      config.connectionRate?.interval ?? 6000
+    )
+    this.maxBufferedBytes = config.maxBufferedBytes ?? 1024 * 1024
+    this.maxReplyBytes = config.maxReplyBytes ?? 512 * 1024
+    this.maxListEntries = config.maxListEntries ?? 500
     this.maxChannels = config.maxChannels ?? 1000
     this.multiline = {
       maxBytes: config.multiline?.maxBytes ?? 4096,
@@ -841,6 +898,28 @@ export class Server {
     return { msgid: id, time: this.#msgTime }
   }
 
+  /**
+   * Take `cost` tokens from the flood control of the client, after the ones that have come back
+   * since it last took some, and return what is left. Below 0, its next command waits. The bucket
+   * is full again once the client has registered, so a registration does not use up what follows.
+   */
+  charge(client: Client, cost: number): number {
+    const options = this.flood
+    if (!options) {
+      return Infinity
+    }
+    const now = Date.now()
+    let bucket = client.bucket
+    if (!bucket || bucket.registered !== client.registered) {
+      bucket = { tokens: options.burst, at: now, registered: client.registered }
+      client.bucket = bucket
+    }
+    bucket.tokens = Math.min(options.burst, bucket.tokens + (now - bucket.at) / options.interval)
+    bucket.at = now
+    bucket.tokens -= cost
+    return bucket.tokens
+  }
+
   /** CASEMAPPING=ascii: only A to Z are folded, so a name with other letters stays as it is. */
   fold(name: string) {
     return name.replace(/[A-Z]+/g, (letters) => letters.toLowerCase())
@@ -897,11 +976,13 @@ export class Server {
         invited.invites.delete(channel)
       }
       channel.invited.clear()
-      // A permanent channel stays stored, with its history. The history of another one goes.
+      // A permanent channel stays stored, with its history. The history of another one goes; if
+      // the database fails, it goes at the next restart.
+      const target = channel.history
       if (channel.permanent) {
-        this.channelStore?.touch(this.fold(channel.name))
-      } else if (channel.history !== undefined) {
-        this.history?.setEnding(channel.history, 1)
+        this.safely(() => this.channelStore?.touch(this.fold(channel.name)))
+      } else if (target !== undefined) {
+        this.safely(() => this.history?.setEnding(target, 1))
       }
     }
   }
@@ -940,10 +1021,61 @@ export class Server {
     return channel && (channel.members.size || !channel.modes.has('s')) ? channel : undefined
   }
 
-  /** Write the state of a channel to the store, if it is permanent and has members. */
+  /**
+   * A channel with members that the client can see: a secret one only from inside. A command
+   * answers for the others as for a channel that does not exist, so that nobody learns of one.
+   */
+  visible(name: string, client: Client): Channel | undefined {
+    const channel = this.channels.get(this.fold(name))
+    return channel?.visibleTo(client) ? channel : undefined
+  }
+
+  /**
+   * Write the state of a channel to the store, if it is permanent and has members. The change has
+   * been made, and told: if the database fails, the channel goes on from memory, and the store has
+   * the state before.
+   */
   persist(channel: Channel) {
     if (channel.permanent && this.channels.get(this.fold(channel.name)) === channel) {
-      this.channelStore?.save(this.fold(channel.name), channel)
+      this.safely(() => this.channelStore?.save(this.fold(channel.name), channel))
+    }
+  }
+
+  // The last failure of the database that was logged, and how many have not been since.
+  #failure = { at: -Infinity, unlogged: 0 }
+
+  /**
+   * Log a failure of the database, once in a while: a database that fails, fails for every message,
+   * and one line a minute tells as much.
+   */
+  report(error: unknown) {
+    const now = Date.now()
+    if (now - this.#failure.at < 60_000) {
+      this.#failure.unlogged++
+      return
+    }
+    const unlogged = this.#failure.unlogged
+    console.error(
+      unlogged
+        ? `The database failed (and ${unlogged} more times since the last log):`
+        : 'The database failed:',
+      error
+    )
+    this.#failure = { at: now, unlogged: 0 }
+  }
+
+  /**
+   * Run a read or write of the store that the server can do without, such as storing a message or
+   * the state of a channel: if it throws, the failure is reported and `undefined` returned, and the
+   * server goes on from memory. A write that the state depends on is done before the state is
+   * changed, so a failure changes neither.
+   */
+  safely<T>(fn: () => T): T | undefined {
+    try {
+      return fn()
+    } catch (error) {
+      this.report(error)
+      return undefined
     }
   }
 
@@ -978,18 +1110,34 @@ export class Server {
   setPermanent(channel: Channel, permanent: boolean) {
     const store = this.channelStore!
     const folded = this.fold(channel.name)
+    // The messages from before are read as in a channel that is not permanent: only by the
+    // members that have joined since. So making a channel permanent widens nobody's access.
+    const since = permanent && channel.history !== undefined ? this.msgid() : undefined
     this.store!.transaction(() => {
       if (permanent) {
-        channel.modes.add('P')
-        store.insert(folded, channel)
+        const { name, created, founder, key, limit, topic, lists, history } = channel
+        store.insert(folded, {
+          name,
+          created,
+          founder,
+          key,
+          limit,
+          topic,
+          lists,
+          history,
+          since,
+          modes: new Set([...channel.modes, 'P']),
+        })
       } else {
-        channel.modes.delete('P')
         store.remove(folded)
       }
       if (channel.history !== undefined) {
         this.history!.setEnding(channel.history, permanent ? null : 0)
       }
     })
+    // Only once it is stored.
+    channel.modes[permanent ? 'add' : 'delete']('P')
+    channel.since = since
   }
 
   /**
@@ -1002,20 +1150,22 @@ export class Server {
     if (!store || !history) {
       return
     }
-    for (const { folded, history: target } of store.expired(now, 10)) {
-      // A channel with members is in use, whatever the store says.
-      if (this.channels.has(folded)) {
-        store.touch(folded, now)
-        continue
-      }
-      this.store!.transaction(() => {
-        store.remove(folded)
-        if (target !== null) {
-          history.setEnding(target, 1)
+    this.safely(() => {
+      for (const { folded, history: target } of store.expired(now, 10)) {
+        // A channel with members is in use, whatever the store says.
+        if (this.channels.has(folded)) {
+          store.touch(folded, now)
+          continue
         }
-      })
-    }
-    history.sweep(now)
+        this.store!.transaction(() => {
+          store.remove(folded)
+          if (target !== null) {
+            history.setEnding(target, 1)
+          }
+        })
+      }
+    })
+    this.safely(() => history.sweep(now))
   }
 
   /**
@@ -1026,14 +1176,17 @@ export class Server {
     if (!history || chat.command === 'TAGMSG') {
       return
     }
-    this.store!.transaction(() => {
-      if (channel.history === undefined) {
-        channel.history = history.createTarget(channel.permanent)
+    // The target is the channel's only once it is stored, so a write that fails leaves none.
+    channel.history = this.store!.transaction(() => {
+      let target = channel.history
+      if (target === undefined) {
+        target = history.createTarget(channel.permanent)
         if (channel.permanent) {
-          this.channelStore!.setHistory(this.fold(channel.name), channel.history)
+          this.channelStore!.setHistory(this.fold(channel.name), target)
         }
       }
-      history.add(channel.history, chat)
+      history.add(target, chat)
+      return target
     })
   }
 

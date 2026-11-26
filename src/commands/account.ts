@@ -118,11 +118,16 @@ export const account = (server: Server) => {
     if ('error' in checked) {
       return
     }
-    if (!accounts!.throttle.take(addressKey(client))) {
+    const release = accounts!.admit(addressKey(client))
+    if (!release) {
       return THROTTLED
     }
-    const credential = await hashPassword(message.params[2], accounts!.iterations)
-    return { name: checked.name, credential } satisfies Prepared
+    try {
+      const credential = await hashPassword(message.params[2], accounts!.iterations)
+      return { name: checked.name, credential } satisfies Prepared
+    } finally {
+      release()
+    }
   })
 
   // `REGISTER {<account> | *} {<email> | *} <password>`
@@ -154,7 +159,15 @@ export const account = (server: Server) => {
         fail('REGISTER', 'TEMPORARILY_UNAVAILABLE', name, 'Account registration failed, try again')
       )
     }
-    if (!accounts!.create(name, prepared.credential, addressKey(client))) {
+    const created = server.safely(() =>
+      accounts!.create(name, prepared.credential, addressKey(client))
+    )
+    if (created === undefined) {
+      return c.render(
+        fail('REGISTER', 'TEMPORARILY_UNAVAILABLE', name, 'Account registration failed, try again')
+      )
+    }
+    if (!created) {
       return c.render(fail('REGISTER', 'ACCOUNT_EXISTS', name, 'Account already exists'))
     }
     c.render(['REGISTER', 'SUCCESS', name, 'Account successfully registered'])

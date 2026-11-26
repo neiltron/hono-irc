@@ -122,13 +122,7 @@ export const deliver = (
     target,
   })
   // The message is delivered even if the database fails.
-  const store = (write: () => void) => {
-    try {
-      write()
-    } catch (error) {
-      console.error(error)
-    }
-  }
+  const store = (write: () => void) => server.safely(write)
   const channel = server.channels.get(server.fold(targetName))
   if (channel) {
     if (!channel.canSend(client)) {

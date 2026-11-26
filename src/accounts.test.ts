@@ -129,11 +129,13 @@ describe('Throttle', () => {
     const throttle = new Throttle(1, 100, 2)
     expect(throttle.take('a', 0)).toBe(true)
     expect(throttle.take('b', 0)).toBe(true)
-    // Both are busy: a new key is refused.
-    expect(throttle.take('c', 50)).toBe(false)
+    expect(throttle.take('a', 10)).toBe(false)
+    // Both are busy: a new key takes the place of the one used the longest ago, b.
+    expect(throttle.take('c', 50)).toBe(true)
     expect(throttle.size).toBe(2)
+    expect(throttle.take('a', 60)).toBe(false)
     // Once they are full again, they are forgotten.
-    expect(throttle.take('c', 200)).toBe(true)
+    expect(throttle.take('d', 200)).toBe(true)
     expect(throttle.size).toBe(1)
   })
 })
