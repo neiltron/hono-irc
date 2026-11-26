@@ -1,6 +1,8 @@
 import { Hono } from 'tcp-hono'
 import {
+  ERR_CHANNELISFULL,
   ERR_CHANOPRIVSNEEDED,
+  ERR_NEEDMOREPARAMS,
   ERR_NOSUCHCHANNEL,
   ERR_NOTONCHANNEL,
   ERR_TOOMANYCHANNELS,
@@ -10,17 +12,34 @@ import {
   RPL_LISTEND,
   RPL_LISTSTART,
 } from '../numerics.ts'
-import { CHANNEL_PATTERN, Channel, MAX_CHANNELS, TOPIC_LENGTH, msg } from '../state.ts'
+import { truncate } from '../protocol.ts'
+import {
+  Channel,
+  KICK_LENGTH,
+  MAX_CHANNELS,
+  MAX_TARGETS,
+  TOPIC_LENGTH,
+  echo,
+  isChannelName,
+  msg,
+  tooMany,
+} from '../state.ts'
 import type { Env, Line, Server } from '../state.ts'
 
 /** Channels: `JOIN`, `PART`, `TOPIC`, `NAMES`, `LIST`, and `KICK`. */
 export const channels = (server: Server) => {
   const app = new Hono<Env>()
 
-  app.on('TCP', '/JOIN/:channels/*', (c) => {
-    const { client } = c.var
+  // Each command takes the parameters from the message, and ignores the ones that it does not use.
 
-    if (c.req.param('channels') === '0') {
+  app.on('TCP', '/JOIN/*', (c) => {
+    const { client, message } = c.var
+    const [list] = message.params
+    if (!list) {
+      return c.render([ERR_NEEDMOREPARAMS, 'JOIN', 'Not enough parameters'])
+    }
+
+    if (list === '0') {
       for (const channel of client.channels) {
         channel.send(msg(client.mask, 'PART', channel.name))
         server.leave(client, channel)
@@ -29,10 +48,10 @@ export const channels = (server: Server) => {
     }
 
     // The replies are rendered for each channel, so the client gets the JOIN of a channel
-    // followed by its topic and names, before the next channel.
-    for (const channelName of c.req.param('channels').split(',')) {
-      if (!CHANNEL_PATTERN.test(channelName)) {
-        c.render([ERR_NOSUCHCHANNEL, channelName, 'No such channel'])
+    // followed by its topic and names, before the next channel. The keys are ignored.
+    for (const channelName of list.split(',')) {
+      if (!isChannelName(channelName)) {
+        c.render([ERR_NOSUCHCHANNEL, echo(channelName), 'No such channel'])
         continue
       }
       let channel = server.channels.get(server.fold(channelName))
@@ -44,6 +63,11 @@ export const channels = (server: Server) => {
         continue
       }
       if (!channel) {
+        // The server is full of channels. ERR_CHANNELISFULL is the reply to JOIN for a limit.
+        if (server.channels.size >= server.maxChannels) {
+          c.render([ERR_CHANNELISFULL, channelName, 'Cannot join channel (too many channels)'])
+          continue
+        }
         channel = new Channel(channelName)
         server.channels.set(server.fold(channelName), channel)
       }
@@ -70,32 +94,40 @@ export const channels = (server: Server) => {
     return c.render()
   })
 
-  app.on('TCP', '/PART/:channels/*', (c) => {
+  app.on('TCP', '/PART/*', (c) => {
     const { client, message } = c.var
+    const [list, reason] = message.params
+    if (!list) {
+      return c.render([ERR_NEEDMOREPARAMS, 'PART', 'Not enough parameters'])
+    }
     const lines: Line[] = []
-    for (const channelName of c.req.param('channels').split(',')) {
+    for (const channelName of list.split(',')) {
       const channel = server.channels.get(server.fold(channelName))
       if (!channel) {
-        lines.push([ERR_NOSUCHCHANNEL, channelName, 'No such channel'])
+        lines.push([ERR_NOSUCHCHANNEL, echo(channelName), 'No such channel'])
       } else if (!channel.members.has(client)) {
         lines.push([ERR_NOTONCHANNEL, channel.name, "You're not on that channel"])
       } else {
-        channel.send(msg(client.mask, 'PART', channel.name, ...message.params.slice(1, 2)))
+        channel.send(
+          msg(client.mask, 'PART', channel.name, ...(reason === undefined ? [] : [reason]))
+        )
         server.leave(client, channel)
       }
     }
     return c.render(...lines)
   })
 
-  app.on('TCP', '/TOPIC/:channel/*', (c) => {
+  app.on('TCP', '/TOPIC/*', (c) => {
     const { client, message } = c.var
-    const channel = server.channels.get(server.fold(c.req.param('channel')))
-    if (!channel) {
-      return c.render([ERR_NOSUCHCHANNEL, c.req.param('channel'), 'No such channel'])
+    // `TOPIC #channel` asks for the topic and `TOPIC #channel :` clears it.
+    const [channelName, text] = message.params
+    if (!channelName) {
+      return c.render([ERR_NEEDMOREPARAMS, 'TOPIC', 'Not enough parameters'])
     }
-    // `TOPIC #channel` asks for the topic and `TOPIC #channel :` clears it,
-    // so the parameter is taken from the message. A path can not have an empty segment.
-    const text = message.params[1]
+    const channel = server.channels.get(server.fold(channelName))
+    if (!channel) {
+      return c.render([ERR_NOSUCHCHANNEL, echo(channelName), 'No such channel'])
+    }
     if (text === undefined) {
       return c.render(...server.topic(channel))
     }
@@ -107,23 +139,33 @@ export const channels = (server: Server) => {
       return c.render([ERR_CHANOPRIVSNEEDED, channel.name, "You're not channel operator"])
     }
     channel.topic = text
-      ? { text: text.slice(0, TOPIC_LENGTH), by: client.mask, at: Math.floor(Date.now() / 1000) }
+      ? {
+          text: truncate(text, TOPIC_LENGTH),
+          by: client.mask,
+          at: Math.floor(Date.now() / 1000),
+        }
       : undefined
     channel.send(msg(client.mask, 'TOPIC', channel.name, channel.topic?.text ?? ''))
     return c.render()
   })
 
-  app.on('TCP', '/NAMES/:channels/*', (c) => {
-    const lines = c.req
-      .param('channels')
-      .split(',')
-      .flatMap((channelName): Line[] => {
+  app.on('TCP', '/NAMES/*', (c) => {
+    const { client, message } = c.var
+    const [list] = message.params
+    // Listing every channel is not supported, which a server may do.
+    if (!list) {
+      return c.render([RPL_ENDOFNAMES, '*', 'End of /NAMES list'])
+    }
+    const { targets, excess } = server.targets(list, MAX_TARGETS.NAMES)
+    return c.render(
+      ...targets.flatMap((channelName): Line[] => {
         const channel = server.channels.get(server.fold(channelName))
         return channel
-          ? server.names(c.var.client, channel)
-          : [[RPL_ENDOFNAMES, channelName, 'End of /NAMES list']]
-      })
-    return c.render(...lines)
+          ? server.names(client, channel)
+          : [[RPL_ENDOFNAMES, echo(channelName), 'End of /NAMES list']]
+      }),
+      ...tooMany(excess)
+    )
   })
 
   app.on('TCP', '/LIST/*', (c) => {
@@ -139,29 +181,36 @@ export const channels = (server: Server) => {
     )
   })
 
-  app.on('TCP', '/KICK/:channel/:nick/*', (c) => {
+  // `KICK #channel nick1,nick2 :reason` kicks each one with a KICK of its own.
+  app.on('TCP', '/KICK/*', (c) => {
     const { client, message } = c.var
-    const channel = server.channels.get(server.fold(c.req.param('channel')))
-    if (!channel) {
-      return c.render([ERR_NOSUCHCHANNEL, c.req.param('channel'), 'No such channel'])
+    const [channelName, list, reason] = message.params
+    if (!channelName || !list) {
+      return c.render([ERR_NEEDMOREPARAMS, 'KICK', 'Not enough parameters'])
     }
-    if (!channel.members.get(client)?.has('o')) {
+    const channel = server.channels.get(server.fold(channelName))
+    if (!channel) {
+      return c.render([ERR_NOSUCHCHANNEL, echo(channelName), 'No such channel'])
+    }
+    const ranks = channel.members.get(client)
+    if (!ranks) {
+      return c.render([ERR_NOTONCHANNEL, channel.name, "You're not on that channel"])
+    }
+    if (!ranks.has('o')) {
       return c.render([ERR_CHANOPRIVSNEEDED, channel.name, "You're not channel operator"])
     }
-    const target = server.nicks.get(server.fold(c.req.param('nick')))
-    if (!target || !channel.members.has(target)) {
-      return c.render([
-        ERR_USERNOTINCHANNEL,
-        c.req.param('nick'),
-        channel.name,
-        "They aren't on that channel",
-      ])
+    const { targets, excess } = server.targets(list, MAX_TARGETS.KICK)
+    const comment = truncate(reason || client.nick, KICK_LENGTH)
+    for (const nick of targets) {
+      const target = server.nicks.get(server.fold(nick))
+      if (!target || !channel.members.has(target)) {
+        c.render([ERR_USERNOTINCHANNEL, echo(nick), channel.name, "They aren't on that channel"])
+        continue
+      }
+      channel.send(msg(client.mask, 'KICK', channel.name, target.nick, comment))
+      server.leave(target, channel)
     }
-    channel.send(
-      msg(client.mask, 'KICK', channel.name, target.nick, message.params[2] ?? client.nick)
-    )
-    server.leave(target, channel)
-    return c.render()
+    return c.render(...tooMany(excess))
   })
 
   return app

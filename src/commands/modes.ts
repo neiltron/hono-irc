@@ -1,7 +1,9 @@
 import { Hono } from 'tcp-hono'
 import {
   ERR_CHANOPRIVSNEEDED,
+  ERR_NEEDMOREPARAMS,
   ERR_NOSUCHCHANNEL,
+  ERR_NOSUCHNICK,
   ERR_UMODEUNKNOWNFLAG,
   ERR_UNKNOWNMODE,
   ERR_USERNOTINCHANNEL,
@@ -11,36 +13,52 @@ import {
   RPL_ENDOFBANLIST,
   RPL_UMODEIS,
 } from '../numerics.ts'
-import { CHANNEL_PATTERN, msg } from '../state.ts'
+import { echo, msg } from '../state.ts'
 import type { Env, Line, Server } from '../state.ts'
 
 /** Modes: `MODE` for a user and for a channel. */
 export const modes = (server: Server) => {
   const app = new Hono<Env>()
 
-  app.on('TCP', '/MODE/:target/*', (c) => {
+  app.on('TCP', '/MODE/*', (c) => {
     const { client, message } = c.var
-    const targetName = c.req.param('target')
-    const [, modes, ...args] = message.params
+    const [targetName, modes, ...args] = message.params
+    if (!targetName) {
+      return c.render([ERR_NEEDMOREPARAMS, 'MODE', 'Not enough parameters'])
+    }
 
     const channel = server.channels.get(server.fold(targetName))
     if (!channel) {
-      if (CHANNEL_PATTERN.test(targetName)) {
-        return c.render([ERR_NOSUCHCHANNEL, targetName, 'No such channel'])
+      if (targetName[0] === '#') {
+        return c.render([ERR_NOSUCHCHANNEL, echo(targetName), 'No such channel'])
       }
       if (server.fold(targetName) !== server.fold(client.nick)) {
-        return c.render([ERR_USERSDONTMATCH, "Can't change mode for other users"])
+        return server.nicks.get(server.fold(targetName))?.registered
+          ? c.render([ERR_USERSDONTMATCH, "Can't change mode for other users"])
+          : c.render([ERR_NOSUCHNICK, echo(targetName), 'No such nick/channel'])
       }
-      if (modes) {
-        const adding = modes[0] !== '-'
-        if (modes.replace(/[+-]/g, '') !== 'i') {
-          return c.render([ERR_UMODEUNKNOWNFLAG, 'Unknown MODE flag'])
+      if (!modes) {
+        return c.render([RPL_UMODEIS, client.invisible ? '+i' : '+'])
+      }
+      // The known modes are applied, and the unknown ones get one ERR_UMODEUNKNOWNFLAG after.
+      let adding = true
+      let unknown = false
+      const before = client.invisible
+      for (const mode of modes) {
+        if (mode === '+' || mode === '-') {
+          adding = mode === '+'
+        } else if (mode === 'i') {
+          client.invisible = adding
+        } else {
+          unknown = true
         }
-        client.invisible = adding
-        client.send(msg(client.nick, 'MODE', client.nick, (adding ? '+' : '-') + 'i'))
-        return c.render()
       }
-      return c.render([RPL_UMODEIS, client.invisible ? '+i' : '+'])
+      if (client.invisible !== before) {
+        client.send(msg(client.nick, 'MODE', client.nick, (client.invisible ? '+' : '-') + 'i'))
+      }
+      return c.render(
+        ...(unknown ? [[ERR_UMODEUNKNOWNFLAG, 'Unknown MODE flag'] satisfies Line] : [])
+      )
     }
 
     if (!modes) {
@@ -71,7 +89,12 @@ export const modes = (server: Server) => {
           continue
         }
         if (!target || !ranks) {
-          lines.push([ERR_USERNOTINCHANNEL, nick, channel.name, "They aren't on that channel"])
+          lines.push([
+            ERR_USERNOTINCHANNEL,
+            echo(nick),
+            channel.name,
+            "They aren't on that channel",
+          ])
         } else if (ranks.has(mode) !== adding) {
           ranks[adding ? 'add' : 'delete'](mode)
           changes.push({ adding, mode, arg: target.nick })
@@ -82,7 +105,7 @@ export const modes = (server: Server) => {
           changes.push({ adding, mode })
         }
       } else {
-        lines.push([ERR_UNKNOWNMODE, mode, 'is unknown mode char to me'])
+        lines.push([ERR_UNKNOWNMODE, echo(mode), 'is unknown mode char to me'])
       }
     }
 

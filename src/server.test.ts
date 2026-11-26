@@ -3,8 +3,9 @@ import { createServer } from './server.ts'
 import type { ServerOptions } from './server.ts'
 import { connect } from './test-utils.ts'
 
+// The flood control is off unless a test turns it on.
 const setup = (config?: ServerOptions) => {
-  const server = createServer(config)
+  const server = createServer({ flood: false, ...config })
   const handler = server.connect
   /** Connect a client and complete the registration. */
   const register = async (nick: string, capabilities: string[] = []) => {
@@ -20,6 +21,26 @@ const setup = (config?: ServerOptions) => {
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+let sentinel = 0
+
+/**
+ * Send the lines, and return what the client gets in reply. A PING follows them, and the lines
+ * up to its PONG are returned, without the source of each line.
+ */
+const exchange = async (client: ReturnType<typeof connect>, ...lines: string[]) => {
+  const token = `sentinel${++sentinel}`
+  const start = client.lines.length
+  await client.send(...lines, `PING ${token}`)
+  await client.waitFor(new RegExp(` PONG \\S+ ${token}$`))
+  return client.lines
+    .slice(start)
+    .filter((line) => !new RegExp(` PONG \\S+ ${token}$`).test(line))
+    .map((line) => line.replace(/^(@\S+ )?:\S+ /, ''))
+}
+
+/** The length of a line in bytes, with its CRLF and without its tags. */
+const bytes = (line: string) => Buffer.byteLength(line.replace(/^@\S+ /, '')) + 2
 
 describe('Registration', () => {
   it('Should welcome a client after NICK and USER', async () => {
@@ -72,7 +93,7 @@ describe('Registration', () => {
     const client = await register('alice')
     await client.send('BOGUS', 'PRIVMSG #hono', 'PING')
     expect(await client.waitFor(/ 421 /)).toContain('421 alice BOGUS :Unknown command')
-    expect(await client.waitFor(/ 461 /)).toContain('461 alice PRIVMSG :Not enough parameters')
+    expect(await client.waitFor(/ 412 /)).toContain('412 alice :No text to send')
     expect(await client.waitFor(/ 461 /)).toContain('461 alice PING :Not enough parameters')
   })
 })
@@ -317,9 +338,11 @@ describe('Registries', () => {
     const lines = client.lines.filter((line) => / 005 /.test(line))
     expect(lines).toHaveLength(2)
     const tokens = lines.map((line) => line.split(' ').slice(3, -5))
-    expect(tokens.map((list) => list.length)).toEqual([13, 6])
-    expect(lines[0]).toMatch(/ 005 alice CASEMAPPING=ascii .* :are supported by this server$/)
-    expect(lines[1]).toMatch(/ 005 alice FAKE4=4 FAKE5 .* FAKE9 :are supported by this server$/)
+    expect(tokens.map((list) => list.length)).toEqual([13, 9])
+    expect(lines[0]).toMatch(
+      / 005 alice CASEMAPPING=ascii .* FAKE0=0 :are supported by this server$/
+    )
+    expect(lines[1]).toMatch(/ 005 alice FAKE1 FAKE2=2 .* FAKE9 :are supported by this server$/)
   })
 })
 
@@ -336,5 +359,521 @@ describe('Connection', () => {
     const [first, second] = server.clients.values()
     expect([first.nick, first.ip, first.secure]).toEqual(['alice', '192.0.2.1', true])
     expect([second.nick, second.ip, second.secure]).toEqual(['bob', undefined, false])
+  })
+})
+
+describe('Parameters', () => {
+  it('Should reply with the numeric of each missing parameter', async () => {
+    const { register } = setup()
+    const alice = await register('alice')
+    expect(
+      await exchange(
+        alice,
+        'NICK',
+        'PRIVMSG',
+        'PRIVMSG alice',
+        'PRIVMSG alice :',
+        'NOTICE',
+        'PING :',
+        'CAP',
+        'CAP REQ',
+        'NAMES',
+        'JOIN',
+        'KICK #hono',
+        'MODE',
+        'ISON',
+        'USERHOST'
+      )
+    ).toEqual([
+      '431 alice :No nickname given',
+      '411 alice :No recipient given (PRIVMSG)',
+      '412 alice :No text to send',
+      '412 alice :No text to send',
+      '409 alice :No origin specified',
+      '461 alice CAP :Not enough parameters',
+      '461 alice CAP :Not enough parameters',
+      '366 alice * :End of /NAMES list',
+      '461 alice JOIN :Not enough parameters',
+      '461 alice KICK :Not enough parameters',
+      '461 alice MODE :Not enough parameters',
+      '461 alice ISON :Not enough parameters',
+      '461 alice USERHOST :Not enough parameters',
+    ])
+  })
+
+  it('Should ignore the parameters that a command does not use', async () => {
+    const { handler } = setup()
+    const client = connect(handler)
+    // The old form of USER, and a NICK with more than one parameter.
+    await client.send('NICK alice extra', 'USER alice host server :Alice A')
+    await client.waitFor(/ 001 alice /)
+    expect(await exchange(client, 'PRIVMSG alice hello world', 'PING a b')).toEqual([
+      'PRIVMSG alice hello',
+      'PONG irc.hono.local a',
+    ])
+  })
+
+  it('Should send back a parameter with a space as one word', async () => {
+    const { register } = setup()
+    const alice = await register('alice')
+    expect(await exchange(alice, 'WHOIS :x y', 'NAMES :a b', 'CAP :x y')).toEqual([
+      '401 alice x :No such nick/channel',
+      '318 alice x :End of /WHOIS list',
+      '366 alice a :End of /NAMES list',
+      '410 alice X :Invalid CAP command',
+    ])
+  })
+})
+
+describe('Registration rules', () => {
+  it('Should reject PASS and USER after the registration', async () => {
+    const { register } = setup()
+    const alice = await register('alice')
+    expect(await exchange(alice, 'PASS secret', 'USER a 0 * :A')).toEqual([
+      '462 alice :You may not reregister',
+      '462 alice :You may not reregister',
+    ])
+  })
+
+  it('Should enable cap-notify with CAP LS 302 and not let it be disabled', async () => {
+    const { handler } = setup()
+    const old = connect(handler)
+    await old.send('CAP LS')
+    await old.waitFor(/ CAP \* LS /)
+    expect(await exchange(old, 'CAP LIST', 'CAP REQ :-cap-notify')).toEqual([
+      'CAP * LIST :',
+      'CAP * ACK -cap-notify',
+    ])
+    const client = connect(handler)
+    await client.send('CAP LS 302')
+    await client.waitFor(/ CAP \* LS /)
+    expect(await exchange(client, 'CAP LIST', 'CAP REQ :-cap-notify', 'CAP REQ :')).toEqual([
+      'CAP * LIST cap-notify',
+      'CAP * NAK -cap-notify',
+      'CAP * ACK :',
+    ])
+  })
+
+  it('Should disconnect a client that does not register in time, whatever it sends', async () => {
+    const { server, handler } = setup({ pingInterval: 100 })
+    const client = connect(handler)
+    await client.send('NICK alice')
+    for (let i = 0; i < 4; i++) {
+      await sleep(40)
+      // The connection may be closed by now.
+      await client.send('PING :keepalive', 'CAP LS').catch(() => {})
+      server.tick()
+    }
+    expect(await client.all()).toContainEqual(expect.stringMatching(/\(Registration timeout\)$/))
+    expect(server.clients.size).toBe(0)
+  })
+
+  it('Should not let the line terminator of a QUIT reason end the ERROR line', async () => {
+    const { register } = setup()
+    const alice = await register('alice')
+    await alice.send('QUIT :bye\rPRIVMSG #x :injected')
+    expect((await alice.all()).at(-1)).toMatch(
+      /^ERROR :Closing Link: \S+ \(Quit: bye PRIVMSG #x :injected\)$/
+    )
+  })
+})
+
+describe('Targets', () => {
+  it('Should drop repeated targets and send ERR_TOOMANYTARGETS over the limit', async () => {
+    const { register } = setup()
+    const alice = await register('alice')
+    const bob = await register('bob')
+    expect(await exchange(alice, 'PRIVMSG bob,BOB,bob,a,b,c,d :hi')).toEqual([
+      '401 alice a :No such nick/channel',
+      '401 alice b :No such nick/channel',
+      '401 alice c :No such nick/channel',
+      '407 alice d :Too many targets',
+    ])
+    expect(bob.lines.filter((line) => / PRIVMSG /.test(line))).toHaveLength(1)
+  })
+
+  it('Should not let one line flood the members of a channel', async () => {
+    const { server, register } = setup()
+    const members = await Promise.all(['v1', 'v2', 'v3'].map((nick) => register(nick)))
+    for (const member of members) {
+      await exchange(member, 'JOIN #r')
+    }
+    const mallory = await register('mallory')
+    await exchange(mallory, 'JOIN #r')
+    const targets = Array(60).fill('#r').join(',')
+    expect(await exchange(mallory, `PRIVMSG ${targets} :${'A'.repeat(100)}`)).toEqual([])
+    await exchange(members[0])
+    const received = members.map(
+      (member) => member.lines.filter((line) => / PRIVMSG #r /.test(line)).length
+    )
+    expect(received).toEqual([1, 1, 1])
+    expect(server.clients.size).toBe(4)
+  })
+
+  it('Should take one target for NAMES, WHO, and WHOIS, and up to four for KICK', async () => {
+    const { register } = setup()
+    const alice = await register('alice')
+    const others = await Promise.all(['b', 'c', 'd', 'e', 'f'].map((nick) => register(nick)))
+    await exchange(alice, 'JOIN #a')
+    for (const other of others) {
+      await exchange(other, 'JOIN #a')
+    }
+    const lines = await exchange(alice, 'NAMES #a,#b', 'WHO #a,#b', 'WHOIS e,f')
+    expect(lines.filter((line) => !/^3(5[23]|1[1279]) /.test(line))).toEqual([
+      '366 alice #a :End of /NAMES list',
+      '407 alice #b :Too many targets',
+      '407 alice #b :Too many targets',
+      '315 alice #a,#b :End of /WHO list',
+      '407 alice f :Too many targets',
+      '318 alice e,f :End of /WHOIS list',
+    ])
+    expect(await exchange(alice, 'KICK #a b,C,c,nobody,d,e :Bye')).toEqual([
+      'KICK #a b Bye',
+      'KICK #a c Bye',
+      "441 alice nobody #a :They aren't on that channel",
+      'KICK #a d Bye',
+      '407 alice e :Too many targets',
+    ])
+    expect(await others[0].waitFor(/ KICK /)).toMatch(/^:alice!\S+ KICK #a b Bye$/)
+  })
+
+  it('Should advertise the limits', async () => {
+    const { register } = setup()
+    const alice = await register('alice')
+    const tokens = alice.lines.filter((line) => / 005 /.test(line)).join(' ')
+    expect(tokens).toContain(' TARGMAX=PRIVMSG:4,NOTICE:4,KICK:4,NAMES:1,WHO:1,WHOIS:1 ')
+    expect(tokens).toContain(' AWAYLEN=300 ')
+    expect(tokens).toContain(' KICKLEN=300 ')
+    expect(tokens).toContain(' CHANNELLEN=50 ')
+  })
+})
+
+describe('Line length', () => {
+  it('Should reply ERR_INPUTTOOLONG to a line that is too long and keep the connection', async () => {
+    const { handler, register } = setup()
+    const alice = await register('alice')
+    const bob = await register('bob')
+    expect(await exchange(alice, `PRIVMSG bob :${'a'.repeat(500)}`)).toEqual([
+      '417 alice :Input line was too long',
+    ])
+    // 4096 bytes of tags and 510 bytes of the rest are accepted.
+    const tags = '@+a=' + 'x'.repeat(4091) + ' '
+    const text = 'b'.repeat(510 - 'PRIVMSG bob :'.length)
+    expect(await exchange(alice, tags + 'PRIVMSG bob :' + text)).toEqual([])
+    expect(await bob.waitFor(/ PRIVMSG /)).toMatch(/ PRIVMSG bob b+$/)
+    // A client that has not registered gets it too.
+    const client = connect(handler)
+    expect(await exchange(client, 'x'.repeat(600))).toEqual(['417 * :Input line was too long'])
+  })
+
+  it('Should keep every line to others within 512 bytes', async () => {
+    const { register } = setup()
+    const alice = await register('a'.repeat(30))
+    const bob = await register('bob')
+    const channel = '#' + '\u{1F600}'.repeat(12)
+    await exchange(alice, `JOIN ${channel}`)
+    await exchange(bob, `JOIN ${channel}`)
+    // The message is cut on a character boundary.
+    await exchange(alice, `PRIVMSG ${channel} :${'é'.repeat(220)}`)
+    const relayed = await bob.waitFor(/ PRIVMSG /)
+    expect(bytes(relayed)).toBeLessThanOrEqual(512)
+    expect(bytes(relayed)).toBeGreaterThan(505)
+    expect(relayed).toMatch(/ PRIVMSG \S+ é+$/)
+    expect(relayed).not.toContain('�')
+  })
+
+  it('Should measure the lengths in bytes', async () => {
+    const { register } = setup()
+    const alice = await register('alice')
+    const bob = await register('bob')
+    expect(
+      await exchange(alice, `JOIN #${'\u{1F600}'.repeat(13)}`, `JOIN #${'\u{1F600}'.repeat(12)}x`)
+    ).toEqual([
+      `403 alice #${'\u{1F600}'.repeat(13)} :No such channel`,
+      `JOIN #${'\u{1F600}'.repeat(12)}x`,
+      `353 alice = #${'\u{1F600}'.repeat(12)}x @alice`,
+      `366 alice #${'\u{1F600}'.repeat(12)}x :End of /NAMES list`,
+    ])
+    await exchange(alice, 'JOIN #a')
+    await exchange(bob, 'JOIN #a')
+    await exchange(alice, `TOPIC #a :${'é'.repeat(240)}`, `KICK #a bob :${'é'.repeat(240)}`)
+    expect(await bob.waitFor(/ TOPIC /)).toMatch(/ TOPIC #a é{195}$/)
+    expect(await bob.waitFor(/ KICK /)).toMatch(/ KICK #a bob é{150}$/)
+    await exchange(alice, `AWAY :${'é'.repeat(240)}`)
+    expect((await exchange(bob, 'WHOIS alice')).find((line) => line.startsWith('301 '))).toMatch(
+      /^301 bob alice é{150}$/
+    )
+  })
+
+  it('Should split NAMES and WHOIS by bytes', async () => {
+    const { register } = setup()
+    const channel = '#' + '\u{1F600}'.repeat(12)
+    const users = []
+    for (let i = 0; i < 30; i++) {
+      const user = await register(`u${'n'.repeat(27)}${String(i).padStart(2, '0')}`)
+      await exchange(user, `JOIN ${channel}`)
+      users.push(user)
+    }
+    const carol = await register('carol')
+    for (let i = 0; i < 50; i++) {
+      await carol.send(`JOIN #${'c'.repeat(45)}${String(i).padStart(3, '0')}`)
+    }
+    await exchange(carol)
+    const dave = await register('d'.repeat(30), ['userhost-in-names', 'multi-prefix'])
+    const names = (await exchange(dave, `NAMES ${channel}`)).filter((line) =>
+      line.startsWith('353 ')
+    )
+    const whois = (await exchange(dave, 'WHOIS carol')).filter((line) => line.startsWith('319 '))
+    expect(names.length).toBeGreaterThan(1)
+    expect(whois.length).toBeGreaterThan(1)
+    for (const line of [...names, ...whois]) {
+      expect(bytes(`:irc.hono.local ${line}`)).toBeLessThanOrEqual(512)
+    }
+    const entries = names.flatMap((line) => line.slice(line.indexOf(' :') + 2).split(' '))
+    expect(entries).toHaveLength(30)
+    const channels = whois.flatMap((line) => line.slice(line.indexOf(' :') + 2).split(' '))
+    expect(channels).toHaveLength(50)
+  })
+})
+
+describe('Channel names', () => {
+  it('Should fold ASCII letters only', async () => {
+    const { server, register } = setup()
+    const alice = await register('alice')
+    await exchange(alice, 'JOIN #Ä', 'JOIN #ä', 'JOIN #HONO', 'JOIN #hono')
+    expect([...server.channels.keys()]).toEqual(['#Ä', '#ä', '#hono'])
+  })
+
+  it('Should reject format characters', async () => {
+    const { register } = setup()
+    const alice = await register('alice')
+    expect(await exchange(alice, 'JOIN #a‎b', 'JOIN #a‮b', 'JOIN #a​b')).toEqual([
+      '403 alice #a‎b :No such channel',
+      '403 alice #a‮b :No such channel',
+      '403 alice #a​b :No such channel',
+    ])
+  })
+})
+
+describe('Queries', () => {
+  it('Should show all the prefixes in WHO and WHOIS with multi-prefix', async () => {
+    const { register } = setup()
+    const alice = await register('alice', ['multi-prefix'])
+    const bob = await register('bob')
+    await exchange(alice, 'JOIN #a', 'MODE #a +v alice')
+    await exchange(bob, 'JOIN #a')
+    const lines = await exchange(alice, 'WHO #a', 'WHOIS alice')
+    expect(lines).toContain(
+      '352 alice #a ~alice ' +
+        lines[0].split(' ')[4] +
+        ' irc.hono.local alice H@+ :0 alice the user'
+    )
+    expect(lines).toContain('319 alice alice @+#a')
+    // Without it, only the highest.
+    expect((await exchange(bob, 'WHO #a')).find((line) => / alice H/.test(line))).toContain(' H@ ')
+  })
+
+  it('Should leave out the clients that have not registered', async () => {
+    const { handler, register } = setup()
+    const ghost = connect(handler)
+    await exchange(ghost, 'NICK ghost')
+    const alice = await register('alice')
+    expect(await exchange(alice, 'WHO ghost', 'LUSERS')).toEqual([
+      '315 alice ghost :End of /WHO list',
+      '251 alice :There are 1 users and 0 invisible on 1 servers',
+      '253 alice 1 :unknown connection(s)',
+      '254 alice 0 :channels formed',
+      '255 alice :I have 1 clients and 0 servers',
+    ])
+  })
+
+  it('Should hide an invisible user from those outside its channel', async () => {
+    const { register } = setup()
+    const alice = await register('alice')
+    const bob = await register('bob')
+    const carol = await register('carol')
+    expect(
+      await exchange(alice, 'MODE alice +iw', 'MODE alice +i', 'MODE Alice', 'JOIN #a')
+    ).toEqual([
+      'MODE alice +i',
+      '501 alice :Unknown MODE flag',
+      '221 alice +i',
+      'JOIN #a',
+      '353 alice = #a @alice',
+      '366 alice #a :End of /NAMES list',
+    ])
+    await exchange(bob, 'JOIN #a')
+    // carol is outside the channel, and bob is in it.
+    expect(await exchange(carol, 'NAMES #a', 'WHO #a', 'LUSERS')).toEqual([
+      '353 carol = #a bob',
+      '366 carol #a :End of /NAMES list',
+      expect.stringMatching(/^352 carol #a ~bob /),
+      '315 carol #a :End of /WHO list',
+      '251 carol :There are 2 users and 1 invisible on 1 servers',
+      '254 carol 1 :channels formed',
+      '255 carol :I have 3 clients and 0 servers',
+    ])
+    expect(await exchange(bob, 'NAMES #a')).toEqual([
+      '353 bob = #a :@alice bob',
+      '366 bob #a :End of /NAMES list',
+    ])
+  })
+
+  it('Should tell a user that does not exist from another user in MODE', async () => {
+    const { register } = setup()
+    const alice = await register('alice')
+    await register('bob')
+    expect(await exchange(alice, 'MODE bob +i', 'MODE nobody', 'MODE #nowhere')).toEqual([
+      "502 alice :Can't change mode for other users",
+      '401 alice nobody :No such nick/channel',
+      '403 alice #nowhere :No such channel',
+    ])
+  })
+
+  it('Should answer ISON and USERHOST', async () => {
+    const { register } = setup()
+    const alice = await register('alice')
+    const bob = await register('bob')
+    await exchange(bob, 'AWAY :lunch')
+    const lines = await exchange(
+      alice,
+      'ISON Bob nobody alice',
+      'ISON :bob alice',
+      'USERHOST bob alice x'
+    )
+    expect(lines[0]).toBe('303 alice :bob alice')
+    expect(lines[1]).toBe('303 alice :bob alice')
+    expect(lines[2]).toMatch(/^302 alice :bob=-~bob@\w+\.user alice=\+~alice@\w+\.user$/)
+  })
+
+  it('Should measure the idle time from the last message', async () => {
+    const { register } = setup()
+    const alice = await register('alice')
+    const bob = await register('bob')
+    await exchange(alice, 'PRIVMSG bob :hi')
+    await sleep(1100)
+    await exchange(alice, 'PING x', 'PONG x', 'LUSERS')
+    const idle = (await exchange(bob, 'WHOIS alice')).find((line) => line.startsWith('317 '))
+    expect(idle).toMatch(/^317 bob alice 1 \d+ :seconds idle, signon time$/)
+  })
+})
+
+describe('Channel rules', () => {
+  it('Should echo a message from outside a channel without the n mode', async () => {
+    const { register } = setup()
+    const alice = await register('alice')
+    const bob = await register('bob', ['echo-message'])
+    await exchange(alice, 'JOIN #a', 'MODE #a -n')
+    expect(await exchange(bob, 'PRIVMSG #a :hi')).toEqual(['PRIVMSG #a hi'])
+    expect(await alice.waitFor(/ PRIVMSG /)).toMatch(/^:bob!\S+ PRIVMSG #a hi$/)
+  })
+
+  it('Should reply ERR_NOTONCHANNEL to a KICK from outside', async () => {
+    const { register } = setup()
+    const alice = await register('alice')
+    const bob = await register('bob')
+    await exchange(alice, 'JOIN #a')
+    expect(await exchange(bob, 'KICK #a alice')).toEqual(["442 bob #a :You're not on that channel"])
+  })
+
+  it('Should tell the others of an AWAY only when it changes', async () => {
+    const { register } = setup()
+    const alice = await register('alice')
+    const bob = await register('bob', ['away-notify'])
+    await exchange(alice, 'JOIN #a')
+    await exchange(bob, 'JOIN #a')
+    await exchange(alice, 'AWAY', 'AWAY :lunch', 'AWAY :lunch', 'AWAY', 'AWAY')
+    await exchange(bob)
+    expect(
+      bob.lines
+        .filter((line) => / AWAY( |$)/.test(line))
+        .map((line) => line.split(' ').slice(1).join(' '))
+    ).toEqual(['AWAY lunch', 'AWAY'])
+  })
+
+  it('Should limit the number of channels on the server', async () => {
+    const { register } = setup({ maxChannels: 2 })
+    const alice = await register('alice')
+    const lines = await exchange(alice, 'JOIN #a,#b,#c')
+    expect(lines.at(-1)).toBe('471 alice #c :Cannot join channel (too many channels)')
+  })
+})
+
+describe('Flood control', () => {
+  it('Should disconnect a client that sends too much', async () => {
+    const { server, handler } = setup({ flood: { burst: 5, interval: 1000 } })
+    const register = async (nick: string) => {
+      const client = connect(handler)
+      // The registration takes 5 tokens, and the bucket is full again after it.
+      await client.send(
+        'CAP LS 302',
+        'CAP REQ :server-time',
+        'NICK ' + nick,
+        'USER x 0 * :X',
+        'CAP END'
+      )
+      await client.waitFor(/ 376 /)
+      return client
+    }
+    const alice = await register('alice')
+    const bob = await register('bob')
+    await bob.send('JOIN #a')
+    await alice.send('JOIN #a')
+    await bob.waitFor(/:alice\S+ JOIN /)
+    // JOIN took 2 tokens, so 3 PRIVMSG are fine and the fourth one is too many.
+    await alice.send('PRIVMSG #a :1', 'PRIVMSG #a :2', 'PRIVMSG #a :3', 'PRIVMSG #a :4')
+    expect((await alice.all()).at(-1)).toMatch(/^ERROR :Closing Link: \S+ \(Excess Flood\)$/)
+    expect(await bob.waitFor(/ QUIT /)).toMatch(/ :alice!\S+ QUIT :Excess Flood$/)
+    expect(bob.lines.filter((line) => / PRIVMSG /.test(line))).toHaveLength(3)
+    await alice.closed
+    expect(server.clients.size).toBe(1)
+  })
+
+  it('Should let a client send again after a while', async () => {
+    const { register } = setup({ flood: { burst: 2, interval: 50 } })
+    const alice = await register('alice')
+    for (let i = 0; i < 5; i++) {
+      await sleep(60)
+      expect(await exchange(alice)).toEqual([])
+    }
+  })
+
+  it('Should be on by default', async () => {
+    const server = createServer()
+    const client = connect(server.connect)
+    await client.send('NICK alice', 'USER alice 0 * :Alice')
+    await client.waitFor(/ 376 /)
+    await client.send(...Array.from({ length: 11 }, (_, i) => `PING ${i}`))
+    expect((await client.all()).at(-1)).toMatch(/\(Excess Flood\)$/)
+  })
+})
+
+describe('Connection limits', () => {
+  it('Should refuse a connection over the limit', async () => {
+    const { server, handler, register } = setup({ maxConnections: 2 })
+    await register('alice')
+    await register('bob')
+    const carol = connect(handler)
+    expect(await carol.all()).toEqual(['ERROR :Closing Link: * (Too many connections)'])
+    await carol.closed
+    // `onClose()` of the refused connection has nothing to clean up.
+    expect([...server.clients.values()].map((client) => client.nick)).toEqual(['alice', 'bob'])
+  })
+
+  it('Should refuse too many connections from one address', async () => {
+    const { server } = setup({ maxConnectionsPerIp: 2 })
+    const from = (ip: string) => connect((socket) => server.connect(socket, { ip }))
+    const first = from('192.0.2.1')
+    from('192.0.2.1')
+    from('198.51.100.1')
+    expect(await from('192.0.2.1').all()).toEqual([
+      'ERROR :Closing Link: * (Too many connections from your address)',
+    ])
+    expect(server.clients.size).toBe(3)
+    await first.end()
+    await first.closed
+    const again = from('192.0.2.1')
+    await again.send('NICK again', 'USER a 0 * :A')
+    await again.waitFor(/ 001 again /)
   })
 })

@@ -61,60 +61,197 @@ export const parse = (line: string): IRCMessage | undefined => {
   return { ...(tags && { tags }), ...(source !== undefined && { source }), command, params }
 }
 
+/** The max length of a line without the tags, in bytes, including the line terminator. */
+export const MAX_LINE_LENGTH = 512
+/** The max length of the tags of a line from a client, in bytes, with `@` and the space after. */
+export const MAX_TAGS_LENGTH = 4096
+
+// The bytes of a character in UTF-8, and whether it is a surrogate pair of two code units.
+// A lone surrogate is encoded as U+FFFD, which is 3 bytes, like `TextEncoder` does.
+const charAt = (value: string, i: number): [size: number, pair: boolean] => {
+  const code = value.charCodeAt(i)
+  if (code < 0x80) {
+    return [1, false]
+  }
+  if (code < 0x800) {
+    return [2, false]
+  }
+  const next = value.charCodeAt(i + 1)
+  return code >= 0xd800 && code < 0xdc00 && next >= 0xdc00 && next < 0xe000 ? [4, true] : [3, false]
+}
+
+/** The length of a string in bytes of UTF-8. */
+export const byteLength = (value: string): number => {
+  let length = 0
+  for (let i = 0; i < value.length; i++) {
+    const [size, pair] = charAt(value, i)
+    length += size
+    i += pair ? 1 : 0
+  }
+  return length
+}
+
+/** Cut a string to at most `max` bytes of UTF-8, without splitting a character. */
+export const truncate = (value: string, max: number): string => {
+  let length = 0
+  for (let i = 0; i < value.length; i++) {
+    const [size, pair] = charAt(value, i)
+    if (length + size > max) {
+      return value.slice(0, i)
+    }
+    length += size
+    i += pair ? 1 : 0
+  }
+  return value
+}
+
 // A line terminator in a parameter would let a client inject a message.
 const clean = (value: string) => value.replace(/[\r\n\0]/g, ' ')
 
-/**
- * Format a message into a line without the line terminator.
- * The last parameter is sent as a trailing parameter if it is empty, has a space, or starts with `:`.
- */
-export const format = (message: IRCMessage): string => {
+// Everything but the tags.
+const formatBody = (message: IRCMessage): string => {
   const parts: string[] = []
-  const tags = Object.entries(message.tags ?? {})
-  if (tags.length) {
-    parts.push('@' + tags.map(([k, v]) => (v === '' ? k : `${k}=${escapeTag(v)}`)).join(';'))
-  }
   if (message.source !== undefined) {
     parts.push(':' + clean(message.source))
   }
   parts.push(message.command)
+  const last = message.params.length - 1
   message.params.forEach((param, i) => {
     param = clean(param)
-    const trailing =
-      i === message.params.length - 1 && (param === '' || param.includes(' ') || param[0] === ':')
-    parts.push(trailing ? ':' + param : param)
+    if (i < last) {
+      // A parameter before the last one can not be empty, have a space, or start with `:`,
+      // or the line would mean something else. The callers should not pass one, but if one
+      // does, the line stays well-formed.
+      param = param.split(' ')[0]
+      parts.push(param && param[0] !== ':' ? param : '*')
+    } else {
+      const trailing = param === '' || param.includes(' ') || param[0] === ':'
+      parts.push(trailing ? ':' + param : param)
+    }
   })
   return parts.join(' ')
 }
 
-export type IRCOptions = {
-  /**
-   * The max length of a line in bytes, including the message tags.
-   * @default 8703 (8191 for the tags and 512 for the rest)
-   */
-  maxLength?: number
+/**
+ * Format a message into a line without the line terminator.
+ * The last parameter is sent as a trailing parameter if it is empty, has a space, or starts with `:`.
+ *
+ * With `max`, the line without the tags is at most `max` bytes: the last parameter is shortened
+ * on a character boundary, and if that is not enough, the line itself is cut.
+ */
+export const format = (message: IRCMessage, max?: number): string => {
+  const tags = Object.entries(message.tags ?? {})
+  const head = tags.length
+    ? '@' + tags.map(([k, v]) => (v === '' ? k : `${k}=${escapeTag(v)}`)).join(';') + ' '
+    : ''
+  let body = formatBody(message)
+  if (max !== undefined && byteLength(body) > max && message.params.length) {
+    const params = [...message.params]
+    const last = clean(params[params.length - 1])
+    // One byte more, for the `:` that a shortened parameter may need, e.g. when it becomes empty.
+    params[params.length - 1] = truncate(last, byteLength(last) - (byteLength(body) - max) - 1)
+    body = formatBody({ ...message, params })
+  }
+  if (max !== undefined && byteLength(body) > max) {
+    body = truncate(body, max)
+  }
+  return head + body
 }
 
 /**
- * Create a function that cuts out lines from chunks. Both CRLF and LF are accepted.
+ * The command of the message that the decoder yields in place of a line that is too long.
+ * It has spaces, so it is never the command of a line from a client. The message has no body.
  */
-const splitLines = (maxLength: number) => {
-  let buffer = new Uint8Array(0)
+export const INPUT_TOO_LONG = 'INPUT TOO LONG'
 
-  return function* (chunk?: Uint8Array): Generator<Uint8Array> {
+export type IRCOptions = {
+  /**
+   * The max length of a line without the tags, in bytes, including the line terminator.
+   * @default 512
+   */
+  maxLength?: number
+  /**
+   * The max length of the tags, in bytes, including `@` and the space after them.
+   * @default 4096
+   */
+  maxTagsLength?: number
+  /**
+   * A line that is too long is skipped up to its line terminator. The connection is closed once
+   * more than this many bytes of one line have been skipped, so the client can not make the
+   * server read forever without a message.
+   * @default 65536
+   */
+  maxSkipLength?: number
+}
+
+const TOO_LONG = Symbol('too long')
+
+/**
+ * Create a function that cuts out lines from chunks. Both CRLF and LF are accepted.
+ * A line that is too long is yielded as `TOO_LONG`, once, and its bytes are dropped.
+ */
+const splitLines = (options: IRCOptions) => {
+  const maxLength = options.maxLength ?? MAX_LINE_LENGTH
+  const maxTagsLength = options.maxTagsLength ?? MAX_TAGS_LENGTH
+  const maxSkipLength = options.maxSkipLength ?? 65536
+  // A line that has not ended can not be longer than this.
+  const limit = maxLength + maxTagsLength
+  // The start of the current line, from the previous chunks.
+  let parts: Uint8Array[] = []
+  let buffered = 0
+  // How many bytes of a line that is too long have been dropped, while it has not ended.
+  let skipped: number | undefined
+
+  // The line has its CR, if any, but not its LF.
+  const tooLong = (line: Uint8Array) => {
+    const tags = line[0] === 0x40 ? line.indexOf(0x20) + 1 || line.length : 0
+    return tags > maxTagsLength || line.length + 1 - tags > maxLength
+  }
+
+  return function* (chunk?: Uint8Array): Generator<Uint8Array | typeof TOO_LONG> {
     if (!chunk) {
       // The end of the stream. A line without a line terminator is not a message.
       return
     }
-    const joined = new Uint8Array(buffer.length + chunk.length)
-    joined.set(buffer)
-    joined.set(chunk, buffer.length)
-    buffer = joined
-    for (let i; (i = buffer.indexOf(10)) !== -1 && i <= maxLength;) {
-      yield buffer.subarray(0, buffer[i - 1] === 13 ? i - 1 : i)
-      buffer = buffer.subarray(i + 1)
+    // Each byte of a chunk is looked at once, and a line is copied at most once.
+    let start = 0
+    for (let end; (end = chunk.indexOf(0x0a, start)) !== -1; start = end + 1) {
+      if (skipped !== undefined) {
+        // The end of the line that was too long.
+        skipped = undefined
+        continue
+      }
+      let line = chunk.subarray(start, end)
+      if (parts.length) {
+        const joined = new Uint8Array(buffered + line.length)
+        let offset = 0
+        for (const part of [...parts, line]) {
+          joined.set(part, offset)
+          offset += part.length
+        }
+        line = joined
+        parts = []
+        buffered = 0
+      }
+      yield tooLong(line)
+        ? TOO_LONG
+        : line.subarray(0, line[line.length - 1] === 0x0d ? -1 : line.length)
     }
-    if (buffer.length > maxLength) {
+
+    const rest = chunk.subarray(start)
+    if (skipped !== undefined) {
+      skipped += rest.length
+    } else if (buffered + rest.length > limit) {
+      // The line can not be valid any more. It is reported at once, and the rest of it is dropped.
+      skipped = buffered + rest.length
+      parts = []
+      buffered = 0
+      yield TOO_LONG
+    } else if (rest.length) {
+      parts.push(rest)
+      buffered += rest.length
+    }
+    if (skipped !== undefined && skipped > maxSkipLength) {
       throw new Error('Line too long')
     }
   }
@@ -127,14 +264,21 @@ const splitLines = (maxLength: number) => {
  * as `/PRIVMSG/#hono/Hello World`. The whole line is available as the body. Use `parse()` to get
  * the tags, the source, and the parameters that a path can not express, such as an empty one.
  *
+ * A line that is too long is not a message. It is routed as `INPUT_TOO_LONG`, without a body,
+ * so the app can reply to it and keep the connection open.
+ *
  * IRC is not a request/response protocol, so most of the output is written with `send()` of
  * the connection. A response without a body, e.g. `c.body(null)`, writes nothing.
  */
 export const irc = (options: IRCOptions = {}): Protocol => ({
   decode: () => {
-    const split = splitLines(options.maxLength ?? 8703)
+    const split = splitLines(options)
     return function* (chunk): Generator<Message> {
       for (const body of split(chunk)) {
+        if (body === TOO_LONG) {
+          yield { args: [INPUT_TOO_LONG] }
+          continue
+        }
         const message = parse(decoder.decode(body))
         if (message) {
           yield { args: [message.command, ...message.params], body }
@@ -144,6 +288,9 @@ export const irc = (options: IRCOptions = {}): Protocol => ({
   },
   respond: async (res, message) => {
     const text = await res.text()
+    if (res.status === 404 && message?.args[0] === INPUT_TOO_LONG) {
+      return new Response('417 * :Input line was too long\r\n')
+    }
     if (res.status === 404) {
       // The app does not have a route for the command and does not have its own `notFound()`.
       return new Response(`421 * ${message?.args[0] ?? '*'} :Unknown command\r\n`)

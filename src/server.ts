@@ -6,8 +6,9 @@ import { messages } from './commands/messages.ts'
 import { modes } from './commands/modes.ts'
 import { queries } from './commands/queries.ts'
 import { registration } from './commands/registration.ts'
-import { ERR_NEEDMOREPARAMS, ERR_NOTREGISTERED, ERR_UNKNOWNCOMMAND } from './numerics.ts'
-import { irc, parse } from './protocol.ts'
+import { flood } from './flood.ts'
+import { ERR_INPUTTOOLONG, ERR_NOTREGISTERED, ERR_UNKNOWNCOMMAND } from './numerics.ts'
+import { INPUT_TOO_LONG, format, irc, parse } from './protocol.ts'
 import type { IRCMessage } from './protocol.ts'
 import { Client, Server, msg } from './state.ts'
 import type { ConnectionInfo, Env, Line, ServerOptions } from './state.ts'
@@ -22,9 +23,16 @@ export const createServer = (config: ServerOptions = {}) => {
   const server = new Server(config)
   const app = new Hono<Env>()
 
+  app.use('*', flood(server))
+
   app.use('*', async (c, next) => {
-    const client = server.clients.get(getConnection(c))!
-    const message = parse(await c.req.text())!
+    const client = server.clients.get(getConnection(c))
+    if (!client) {
+      // A connection that was refused in `onOpen()`. Its read loop ends without a message.
+      return c.body(null)
+    }
+    // A line that was too long comes without a body, and the rest are lines that parse.
+    const message = parse(await c.req.text()) ?? { command: INPUT_TOO_LONG, params: [] }
     client.active = Date.now()
     client.pinged = false
     c.set('client', client)
@@ -69,7 +77,10 @@ export const createServer = (config: ServerOptions = {}) => {
       // A body that a handler writes itself, such as the ERROR of QUIT, follows the outbox.
       const body = c.finalized ? await c.res.text() : ''
       const lines = outbox.map((message) => client.format(message))
-      c.res = new Response([...lines, ...(body ? [body] : [])].join('\r\n'))
+      // The headers are kept for `Connection: close`.
+      c.res = new Response([...lines, ...(body ? [body] : [])].join('\r\n'), {
+        headers: c.res.headers,
+      })
     }
   })
 
@@ -79,15 +90,16 @@ export const createServer = (config: ServerOptions = {}) => {
   app.route('/', modes(server))
   app.route('/', queries(server))
 
-  // A command that is not routed: unknown, or without the required parameters.
-  // `app.route()` adds the routes of a module to `app.routes`, so they are all here.
-  const commands = new Set(app.routes.flatMap((route) => route.path.match(/[A-Z]{2,}/g) ?? []))
-  app.notFound((c) => {
-    const { command } = c.var.message
-    return commands.has(command)
-      ? c.render([ERR_NEEDMOREPARAMS, command, 'Not enough parameters'])
-      : c.render([ERR_UNKNOWNCOMMAND, command, 'Unknown command'])
-  })
+  // The decoder yields this in place of a line that is too long. The line is dropped and the
+  // connection stays open.
+  app.on('TCP', '/' + encodeURIComponent(INPUT_TOO_LONG), (c) =>
+    c.render([ERR_INPUTTOOLONG, 'Input line was too long'])
+  )
+  server.beforeRegistration.add(INPUT_TOO_LONG)
+
+  // Every command is routed as `/COMMAND/*` and checks its own parameters, so a command that is
+  // not routed is unknown.
+  app.notFound((c) => c.render([ERR_UNKNOWNCOMMAND, c.var.message.command, 'Unknown command']))
 
   app.onError((error, c) => {
     console.error(error)
@@ -100,11 +112,43 @@ export const createServer = (config: ServerOptions = {}) => {
   const options: TCPOptions = {
     protocol: irc(),
     onOpen: (connection) => {
+      const ip = pending?.ip
+      const reason =
+        server.clients.size >= server.maxConnections
+          ? 'Too many connections'
+          : ip !== undefined && (server.addresses.get(ip) ?? 0) >= server.maxConnectionsPerIp
+            ? 'Too many connections from your address'
+            : undefined
+      if (reason) {
+        // The connection does not get a client. tcp-hono writes the ERROR, ends the read loop,
+        // and calls `onClose()`, which has nothing to clean up.
+        connection.send(
+          format({ command: 'ERROR', params: [`Closing Link: * (${reason})`] }) + '\r\n'
+        )
+        connection.close()
+        return
+      }
       server.clients.set(connection, new Client(server, connection, pending))
+      if (ip !== undefined) {
+        server.addresses.set(ip, (server.addresses.get(ip) ?? 0) + 1)
+      }
     },
     onClose: (connection) => {
-      const client = server.clients.get(connection)!
+      // tcp-hono calls `onClose()` for every connection that it called `onOpen()` for, including
+      // the refused ones, and if `onOpen()` threw.
+      const client = server.clients.get(connection)
+      if (!client) {
+        return
+      }
       server.clients.delete(connection)
+      if (client.ip !== undefined) {
+        const count = (server.addresses.get(client.ip) ?? 1) - 1
+        if (count) {
+          server.addresses.set(client.ip, count)
+        } else {
+          server.addresses.delete(client.ip)
+        }
+      }
       if (server.nicks.get(server.fold(client.nick)) === client) {
         server.nicks.delete(server.fold(client.nick))
       }
@@ -140,12 +184,19 @@ export const createServer = (config: ServerOptions = {}) => {
     const now = Date.now()
     for (const client of server.clients.values()) {
       const silent = now - client.active
+      // The registration has to be done in time from the connection, whatever the client sends.
       if (
-        silent > server.pingInterval * 2 ||
-        (!client.registered && silent > server.pingInterval)
+        client.registered
+          ? silent > server.pingInterval * 2
+          : now - client.signon > server.pingInterval
       ) {
         client.quit = client.registered ? 'Ping timeout' : 'Registration timeout'
-        client.connection.send(`ERROR :Closing Link: ${client.host} (${client.quit})\r\n`)
+        const error = format({
+          command: 'ERROR',
+          params: [`Closing Link: ${client.host} (${client.quit})`],
+        })
+        // tcp-hono writes what is queued before it closes the socket.
+        client.connection.send(error + '\r\n')
         client.connection.close()
       } else if (silent > server.pingInterval && !client.pinged) {
         client.pinged = true

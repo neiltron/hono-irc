@@ -3,11 +3,16 @@ import {
   ERR_ALREADYREGISTERED,
   ERR_ERRONEUSNICKNAME,
   ERR_INVALIDCAPCMD,
+  ERR_NEEDMOREPARAMS,
   ERR_NICKNAMEINUSE,
+  ERR_NONICKNAMEGIVEN,
+  ERR_NOORIGIN,
 } from '../numerics.ts'
-import { msg } from '../state.ts'
+import { MAX_LINE_LENGTH, format } from '../protocol.ts'
+import { echo, msg } from '../state.ts'
 import type { Env, Line, Server } from '../state.ts'
 
+// NICK_LENGTH characters, which are ASCII, so it is also the length in bytes.
 const NICK_PATTERN = /^[A-Za-z_[\]\\`^{}|][A-Za-z0-9_\-[\]\\`^{}|]{0,29}$/
 // A `CAP LS` reply is split into lines of this many bytes of capabilities.
 const CAP_LS_LENGTH = 400
@@ -18,13 +23,23 @@ const encoder = new TextEncoder()
 export const registration = (server: Server) => {
   const app = new Hono<Env>()
 
-  app.on('TCP', '/CAP/:subcommand/*', (c) => {
+  // Each command takes the parameters from the message, and ignores the ones that it does not use.
+
+  app.on('TCP', '/CAP/*', (c) => {
     const { client, message } = c.var
-    const subcommand = c.req.param('subcommand').toUpperCase()
+    if (!message.params.length) {
+      return c.render([ERR_NEEDMOREPARAMS, 'CAP', 'Not enough parameters'])
+    }
+    const subcommand = message.params[0].toUpperCase()
     const target = client.nick
 
     if (subcommand === 'LS') {
       client.negotiating ||= !client.registered
+      // `CAP LS 302` enables cap-notify implicitly, and it can not be disabled after that.
+      client.capVersion = Math.max(client.capVersion, Number(message.params[1]) || 0)
+      if (client.capVersion >= 302) {
+        client.capabilities.add('cap-notify')
+      }
       const capabilities = [...server.capabilities].sort(([a], [b]) => (a < b ? -1 : 1))
       // Before version 302, a client gets the names only, in one line.
       if (!(Number(message.params[1]) >= 302)) {
@@ -51,10 +66,16 @@ export const registration = (server: Server) => {
       return c.render(['CAP', target, 'LIST', [...client.capabilities].join(' ')])
     }
     if (subcommand === 'REQ') {
+      const requested = message.params[1]
+      if (requested === undefined) {
+        return c.render([ERR_NEEDMOREPARAMS, 'CAP', 'Not enough parameters'])
+      }
       client.negotiating ||= !client.registered
-      const requested = message.params.at(-1) ?? ''
       const changes = requested.split(' ').filter(Boolean)
-      if (!changes.every((cap) => server.capabilities.has(cap.replace(/^-/, '')))) {
+      if (
+        !changes.every((cap) => server.capabilities.has(cap.replace(/^-/, ''))) ||
+        (client.capVersion >= 302 && changes.includes('-cap-notify'))
+      ) {
         return c.render(['CAP', target, 'NAK', requested])
       }
       for (const cap of changes) {
@@ -70,16 +91,29 @@ export const registration = (server: Server) => {
       client.negotiating = false
       return c.render(...server.register(client))
     }
-    return c.render([ERR_INVALIDCAPCMD, subcommand, 'Invalid CAP command'])
+    return c.render([ERR_INVALIDCAPCMD, echo(subcommand), 'Invalid CAP command'])
   })
 
-  app.on('TCP', '/PASS/*', (c) => c.render())
+  // The password is not checked, but it can only be sent before the registration.
+  app.on('TCP', '/PASS/*', (c) => {
+    const { client, message } = c.var
+    if (client.registered) {
+      return c.render([ERR_ALREADYREGISTERED, 'You may not reregister'])
+    }
+    if (!message.params.length) {
+      return c.render([ERR_NEEDMOREPARAMS, 'PASS', 'Not enough parameters'])
+    }
+    return c.render()
+  })
 
-  app.on('TCP', '/NICK/:nick', (c) => {
-    const { client } = c.var
-    const nick = c.req.param('nick')
+  app.on('TCP', '/NICK/*', (c) => {
+    const { client, message } = c.var
+    const nick = message.params[0]
+    if (!nick) {
+      return c.render([ERR_NONICKNAMEGIVEN, 'No nickname given'])
+    }
     if (!NICK_PATTERN.test(nick)) {
-      return c.render([ERR_ERRONEUSNICKNAME, nick, 'Erroneous nickname'])
+      return c.render([ERR_ERRONEUSNICKNAME, echo(nick), 'Erroneous nickname'])
     }
     const owner = server.nicks.get(server.fold(nick))
     if (owner && owner !== client) {
@@ -99,23 +133,32 @@ export const registration = (server: Server) => {
     return c.render(...server.register(client))
   })
 
-  app.on('TCP', '/USER/:user/:mode/:unused/:realname', (c) => {
-    const { client } = c.var
+  app.on('TCP', '/USER/*', (c) => {
+    const { client, message } = c.var
     if (client.registered) {
       return c.render([ERR_ALREADYREGISTERED, 'You may not reregister'])
     }
+    const [user, , , realname] = message.params
+    if (!user || !realname) {
+      return c.render([ERR_NEEDMOREPARAMS, 'USER', 'Not enough parameters'])
+    }
     // The username is not verified with Ident.
-    client.user =
-      '~' +
-      (c.req
-        .param('user')
-        .replace(/[^\w.-]/g, '')
-        .slice(0, 10) || 'user')
-    client.realname = c.req.param('realname')
+    client.user = '~' + (user.replace(/[^\w.-]/g, '').slice(0, 10) || 'user')
+    client.realname = realname
     return c.render(...server.register(client))
   })
 
-  app.on('TCP', '/PING/:token', (c) => c.render(['PONG', server.name, c.req.param('token')]))
+  app.on('TCP', '/PING/*', (c) => {
+    const [token] = c.var.message.params
+    if (token === undefined) {
+      return c.render([ERR_NEEDMOREPARAMS, 'PING', 'Not enough parameters'])
+    }
+    // The token may be any non-empty string. Some servers say ERR_NOORIGIN for an empty one.
+    if (!token) {
+      return c.render([ERR_NOORIGIN, 'No origin specified'])
+    }
+    return c.render(['PONG', server.name, token])
+  })
 
   app.on('TCP', '/PONG/*', (c) => c.render())
 
@@ -123,9 +166,15 @@ export const registration = (server: Server) => {
     const { client, message } = c.var
     client.quit = `Quit: ${message.params[0] ?? ''}`.trim()
     // The connection is closed after the response, and the others are notified in `onClose()`.
-    // The ERROR line is the body of the response itself, without a source or tags.
+    // The ERROR line is the body of the response itself, without a source or tags. It is formatted
+    // like any other line, so a line terminator in the reason can not end it.
     c.header('Connection', 'close')
-    return c.text(`ERROR :Closing Link: ${client.host} (${client.quit})`)
+    return c.text(
+      format(
+        { command: 'ERROR', params: [`Closing Link: ${client.host} (${client.quit})`] },
+        MAX_LINE_LENGTH - 2
+      )
+    )
   })
 
   return app
