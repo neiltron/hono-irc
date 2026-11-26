@@ -357,9 +357,9 @@ describe('Connection', () => {
     const bob = connect(server.connect)
     await alice.send('NICK alice', 'USER alice 0 * :Alice')
     await bob.send('NICK bob', 'USER bob 0 * :Bob')
-    // The host is not the address.
-    expect(await alice.waitFor(/ 001 /)).toMatch(/alice!~alice@\w+\.user$/)
-    await bob.waitFor(/ 001 /)
+    // The host is a cloak of the address, and a client without an address gets a random one.
+    expect(await alice.waitFor(/ 001 /)).toMatch(/alice!~alice@[\da-f]{8}(\.[\da-f]{8}){2}\.ip4$/)
+    expect(await bob.waitFor(/ 001 /)).toMatch(/bob!~bob@[\da-f]{8}\.user$/)
     const [first, second] = server.clients.values()
     expect([first.nick, first.ip, first.secure]).toEqual(['alice', '192.0.2.1', true])
     expect([second.nick, second.ip, second.secure]).toEqual(['bob', undefined, false])

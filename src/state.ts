@@ -20,6 +20,7 @@ import {
   ERR_NOMOTD,
   ERR_TOOMANYTARGETS,
 } from './numerics.ts'
+import { cloak } from './cloak.ts'
 import { MAX_LINE_LENGTH, MAX_TAG_DATA, byteLength, format, tagsLength } from './protocol.ts'
 import type { IRCMessage } from './protocol.ts'
 
@@ -59,6 +60,12 @@ export type ServerOptions = {
   maxChannels?: number
   /** The limits of a `draft/multiline` batch from a client. */
   multiline?: MultilineOptions
+  /**
+   * The key of the cloaks, the hosts that are shown in place of the addresses. A client gets the
+   * same cloak each time it connects from the same address while the key stays the same. Random
+   * for each server by default.
+   */
+  cloakSecret?: string
 }
 
 /** The limits of a `draft/multiline` batch, which `CAP LS 302` shows. */
@@ -208,8 +215,11 @@ export class Client {
   nick = '*'
   user = ''
   realname = ''
-  /** The real address is not exposed to the other users. */
-  host = `${crypto.randomUUID().slice(0, 8)}.user`
+  /**
+   * The real address is not exposed to the other users. The host is a cloak of the address if the
+   * runtime knows it, which stays the same for the same address, or random otherwise.
+   */
+  host: string
   /** The address of the client, if the runtime knows it. It is not shown to the other users. */
   ip?: string
   /** Whether the connection is encrypted. */
@@ -251,6 +261,10 @@ export class Client {
     this.connection = connection
     this.ip = info.ip
     this.secure = info.secure ?? false
+    this.host =
+      info.ip === undefined
+        ? `${crypto.randomUUID().slice(0, 8)}.user`
+        : cloak(info.ip, server.cloakSecret)
   }
 
   get mask() {
@@ -393,6 +407,7 @@ export class Server {
   maxConnectionsPerIp: number
   maxChannels: number
   multiline: Required<MultilineOptions>
+  cloakSecret: string
   created = new Date()
 
   clients = new Map<Connection, Client>()
@@ -460,6 +475,11 @@ export class Server {
       maxLines: config.multiline?.maxLines ?? 100,
       timeout: config.multiline?.timeout ?? 30_000,
     }
+    this.cloakSecret =
+      config.cloakSecret ??
+      Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) =>
+        byte.toString(16).padStart(2, '0')
+      ).join('')
     this.isupport = new Map<string, string | true>([
       ['CASEMAPPING', 'ascii'],
       ['CHANTYPES', '#'],

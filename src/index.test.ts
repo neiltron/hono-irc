@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test'
-import type { ConnectionInfo } from './server.ts'
+import type { ConnectionInfo, ServerOptions } from './server.ts'
 
 // The Worker runs on Node.js here: the runtime module and the server are replaced, so the tests
 // see what the Worker and the object hand over to the server.
@@ -15,18 +15,28 @@ vi.mock('cloudflare:workers', () => ({
 }))
 
 const connections: ConnectionInfo[] = []
+const servers: ServerOptions[] = []
 vi.mock('./server.ts', () => ({
-  createServer: () => ({
-    connect: async (_socket: unknown, info: ConnectionInfo) => {
-      connections.push(info)
-    },
-    tick: () => {},
-  }),
+  createServer: (options: ServerOptions) => {
+    servers.push(options)
+    return {
+      connect: async (_socket: unknown, info: ConnectionInfo) => {
+        connections.push(info)
+      },
+      tick: () => {},
+    }
+  },
 }))
 
 const { Network, default: worker } = await import('./index.ts')
 
 type Env = ConstructorParameters<typeof Network>[1]
+
+/** The state of an object, with the synchronous KV API of the storage in a Map. */
+const state = (kv = new Map<string, unknown>()) =>
+  ({
+    storage: { kv: { get: (key: string) => kv.get(key), put: kv.set.bind(kv) } },
+  }) as unknown as DurableObjectState
 
 /** A socket whose streams are already closed. */
 const socket = (info: { remoteAddress?: string; localAddress?: string }) =>
@@ -58,6 +68,7 @@ const environment = () => {
 beforeEach(() => {
   vi.useFakeTimers()
   connections.length = 0
+  servers.length = 0
 })
 
 afterEach(() => {
@@ -86,9 +97,24 @@ describe('The address of a TCP client', () => {
     ['192.0.2.1:4242\r\nNICK x', undefined],
     [undefined, undefined],
   ])('Should read %s as %s in the object', async (localAddress, ip) => {
-    const network = new Network({} as DurableObjectState, {} as Env)
+    const network = new Network(state(), {} as Env)
     await network.connect(socket({ localAddress }))
     expect(connections).toEqual([{ ip, secure: false }])
+  })
+})
+
+describe('The key of the cloaks', () => {
+  it('Should be made once and kept in the storage of the object', () => {
+    const kv = new Map<string, unknown>()
+    new Network(state(kv), {} as Env)
+    new Network(state(kv), {} as Env)
+    new Network(state(), {} as Env)
+    const [first, again, other] = servers.map((options) => options.cloakSecret)
+    expect(first).toMatch(/^[\da-f]{64}$/)
+    expect(again).toBe(first)
+    expect(other).not.toBe(first)
+    expect([...kv]).toEqual([['cloakSecret', first]])
+    expect(servers[0].name).toBe('irc.hono.local')
   })
 })
 
@@ -125,7 +151,7 @@ describe('The HTTP requests to the Worker', () => {
   })
 
   it('Should accept only a WebSocket upgrade in the object', async () => {
-    const network = new Network({} as DurableObjectState, {} as Env)
+    const network = new Network(state(), {} as Env)
     const res = await network.fetch(new Request('https://irc.example/'))
     expect(res.status).toBe(426)
     expect(res.headers.get('Upgrade')).toBe('websocket')

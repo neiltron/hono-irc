@@ -36,6 +36,7 @@ app.on('TCP', '/PRIVMSG/:targets/:text', (c) => { ... })
 | [`src/state.ts`](./src/state.ts)                                 | `Client`, `Channel`, and `Server`: the state, the registries, and helpers |
 | [`src/server.ts`](./src/server.ts)                               | `createServer()`. A Hono app that does not depend on a runtime            |
 | [`src/flood.ts`](./src/flood.ts)                                 | The flood control: a token bucket and fake lag for each connection        |
+| [`src/cloak.ts`](./src/cloak.ts)                                 | The cloaks: the hosts shown in place of the addresses, with HMAC-SHA-256  |
 | [`src/commands/registration.ts`](./src/commands/registration.ts) | `CAP`, `NICK`, `USER`, `PASS`, `PING`, `PONG`, `QUIT`                     |
 | [`src/commands/channels.ts`](./src/commands/channels.ts)         | `JOIN`, `PART`, `TOPIC`, `NAMES`, `LIST`, `KICK`                          |
 | [`src/commands/messages.ts`](./src/commands/messages.ts)         | `PRIVMSG`, `NOTICE`, `TAGMSG`, `AWAY`                                     |
@@ -97,7 +98,7 @@ The dependency is pinned to a commit, and pnpm builds it on install. To update i
 - `CASEMAPPING=ascii`. The lengths of `NICKLEN`, `CHANNELLEN`, `TOPICLEN`, `AWAYLEN`, and `KICKLEN` are in bytes.
 - Lines: a client can send 4096 bytes of tags and 512 bytes of the rest. A longer line gets `ERR_INPUTTOOLONG` and is dropped. A line from the server is at most 512 bytes without the tags: a longer last parameter is cut. The tags that the server adds come first and are far below their 4094 bytes, and the relayed client-only tags are at most 4094 bytes, so a line has at most 8191 bytes of tags.
 - Targets: `PRIVMSG`, `NOTICE`, `TAGMSG`, and `KICK` take up to four, and `NAMES`, `WHO`, and `WHOIS` one, as `TARGMAX` shows. A repeated target counts once.
-- The address of the client is passed to the server, from `CF-Connecting-IP` for a WebSocket and from the Worker for TCP (see below). It is not shown to the other users, who see a random host.
+- The address of the client is passed to the server, from `CF-Connecting-IP` for a WebSocket and from the Worker for TCP (see below). It is not shown to the other users, who see a cloak (see below).
 - A client that does not answer a `PING` is disconnected, and so is one that has not registered in time after it connected.
 - Limits, set with the options of `createServer()`:
   - `flood`: a token bucket for each connection, by default 10 commands at once and one more every 2 seconds, with `NICK`, `JOIN`, and `PART` taking more. A client that runs out is not disconnected: its commands wait until the tokens are back (fake lag), so a burst is handled in full and in order, only slower. The others are not slowed down. `false` turns it off. The lines of a multiline batch are free, and the batch takes one token for every 512 bytes or every 5 lines, whichever is more, when it ends.
@@ -118,6 +119,16 @@ For a WebSocket, the address is `CF-Connecting-IP`, which Cloudflare sets. Under
 The Durable Object does not see a TCP client: the Worker pipes the socket to it. So the Worker connects to the object with the address of the client, `remoteAddress` of its socket (`192.0.2.1:4242` or `[2001:db8::1]:4242`), as the address to connect to, which the object receives as `localAddress`. Only the Worker sets it, so the bytes from a client can not forge it. When `remoteAddress` is missing, which the documentation allows for a connection from Spectrum, the address is unknown.
 
 This has been tried under `cf dev` with IPv4 clients, and the address strings of IPv6 have been passed through `connect()`, but not from an IPv6 client. It has not been tried deployed.
+
+### Cloaks
+
+The other users see a cloak in place of the address: `<address>.<network>.<wider network>.ip4`, where each label is 32 bits of HMAC-SHA-256 of a part of the address with the key `cloakSecret` of `createServer()`. The parts are the /32, the /24, and the /16 for IPv4, and the /128, the /64, and the /48 for IPv6 (with `.ip6`). An IPv4 address mapped to IPv6 is cloaked as IPv4.
+
+- A client gets the same cloak each time it connects from the same address, so a ban on its host holds. The clients of a network share the end of their cloaks, so `*!*@*.<network>.<wider network>.ip4` bans a /24 (or a /64).
+- Without the key, nobody can tell the address from a cloak, or work out the cloak of an address to compare it.
+- The hash is in plain JavaScript (`src/cloak.ts`), because a client is made synchronously when it connects, and the digests of WebCrypto are asynchronous. The tests compare it with `node:crypto`.
+- The Durable Object makes the key once and keeps it in its storage, with the synchronous KV API of SQLite-backed objects, so the cloaks stay the same across restarts and deploys. On Node.js, the key is random for each process unless `cloakSecret` is given.
+- A client whose address is unknown gets a random host, `<random>.user`, which changes on each connection.
 
 ## Deploying
 

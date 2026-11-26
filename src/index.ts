@@ -14,6 +14,23 @@ const options = { name: 'irc.hono.local', network: 'HonoIRC' } satisfies ServerO
 const UNKNOWN = 'irc:6667'
 
 /**
+ * The key of the cloaks, which is made once and kept in the storage of the object, so a client
+ * keeps its cloak, and a ban on it holds, across restarts and deploys. The synchronous KV API of
+ * a SQLite-backed object lets the constructor read it before the server is made.
+ */
+const cloakSecret = (storage: DurableObjectStorage): string => {
+  const stored = storage.kv.get<string>('cloakSecret')
+  if (stored) {
+    return stored
+  }
+  const secret = Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) =>
+    byte.toString(16).padStart(2, '0')
+  ).join('')
+  storage.kv.put('cloakSecret', secret)
+  return secret
+}
+
+/**
  * The address of the client from `host:port`, as in `remoteAddress` of a socket: `192.0.2.1:4242`
  * or `[2001:db8::1]:4242`. Anything else, such as `irc:6667`, is unknown.
  */
@@ -36,10 +53,11 @@ const parseAddress = (address = ''): string | undefined => {
  * so they do not need to be stored while the object has a connection.
  */
 export class Network extends DurableObject<Env> {
-  #server = createServer(options)
+  #server: ReturnType<typeof createServer>
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
+    this.#server = createServer({ ...options, cloakSecret: cloakSecret(ctx.storage) })
     setInterval(this.#server.tick, 30_000)
   }
 
