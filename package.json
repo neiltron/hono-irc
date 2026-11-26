@@ -1,0 +1,34 @@
+{
+  "name": "hono-irc",
+  "version": "0.0.1",
+  "private": true,
+  "description": "An IRC server on Cloudflare Workers and Durable Objects, built with Hono",
+  "type": "module",
+  "scripts": {
+    "dev": "cf dev",
+    "dev:node": "node src/node.ts",
+    "build": "cf build",
+    "deploy": "cf deploy",
+    "test": "vp test run",
+    "check": "vp check",
+    "format": "vp fmt",
+    "typecheck": "cf workers types && tsc --noEmit"
+  },
+  "dependencies": {
+    "hono": "^4.13.22",
+    "tcp-hono": "github:neiltron/tcp-hono#e097eedd2f6c54847de20a6320260a813ff56736"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "^2.0.0-rc.5",
+    "@types/node": "^24.0.0",
+    "cf": "^1.0.0-rc.6",
+    "typescript": "^7.0.2",
+    "vite": "npm:@voidzero-dev/vite-plus-core@8.3.8001",
+    "vite-plus": "1.8.0",
+    "vitest": "5.1.1"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "pnpm@11.24.0"
+}

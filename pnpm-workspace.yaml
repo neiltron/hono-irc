@@ -1,0 +1,13 @@
+overrides:
+  vite: npm:@voidzero-dev/vite-plus-core@8.3.8001
+  vitest: 5.1.1
+
+allowBuilds:
+  'tcp-hono@https://codeload.github.com/neiltron/tcp-hono/tar.gz/e097eedd2f6c54847de20a6320260a813ff56736': true
+  esbuild: true
+  workerd: true
+  sharp: true
+
+minimumReleaseAgeExclude:
+  - cf@1.0.0-rc.6
+  - hono@4.13.22
