@@ -133,7 +133,8 @@ describe('REGISTER', () => {
         'REGISTER * * password1'
       )
     ).toEqual([
-      expect.stringContaining('CAP * LS'),
+      expect.stringContaining('CAP * LS * '),
+      expect.stringContaining('CAP * LS '),
       ':irc.example CAP * ACK draft/account-registration',
       ':irc.example FAIL REGISTER NEED_NICK * :You must choose a nickname first',
     ])

@@ -3,7 +3,9 @@ import { Hono, getConnection, tcp } from 'tcp-hono'
 import type { Socket, TCPOptions } from 'tcp-hono'
 import { account } from './commands/account.ts'
 import { channels } from './commands/channels.ts'
+import { chathistory } from './commands/chathistory.ts'
 import { messages } from './commands/messages.ts'
+import { markread } from './commands/markread.ts'
 import { modes } from './commands/modes.ts'
 import { expire, multiline } from './commands/multiline.ts'
 import { monitor } from './commands/monitor.ts'
@@ -263,6 +265,9 @@ export const createServer = (config: ServerOptions = {}) => {
   app.route('/', setname(server))
   app.route('/', sasl(server))
   app.route('/', account(server))
+  // The read marker of a channel comes before the messages that a client gets when it joins.
+  app.route('/', markread(server))
+  app.route('/', chathistory(server))
 
   // The decoder yields this in place of a line that is too long. The line is dropped and the
   // connection stays open.

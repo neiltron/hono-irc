@@ -608,6 +608,93 @@ await step('extended-join, account-tag, WHOIS, and WHOX show the account', async
   await gone
 })
 
+await step('a permanent channel, draft/chathistory, and draft/read-marker', async () => {
+  // A new channel on each run, as it stays on a server that keeps its database.
+  const chan = `#hist${Math.floor(Math.random() * 1e6)}`
+  const caps = ['draft/chathistory', 'draft/read-marker', 'echo-message', 'server-time']
+  const options = { account: { account, password } }
+  let founder = await connect(account, caps, options)
+  assert.equal(founder.network.supports('CHATHISTORY'), '100')
+  assert.equal(founder.network.supports('MSGREFTYPES'), 'msgid,timestamp')
+  assert.deepEqual(founder.network.supports('CHANMODES'), ['beI', 'k', 'l', 'Pimnst'])
+  let names = once(founder, 'userlist', (e) => e.channel === chan)
+  const marker = line(founder, new RegExp(` MARKREAD ${chan} \\*$`))
+  founder.join(chan)
+  assert.deepEqual(users(await names), [`o${account}`])
+  await marker
+  // The channel of an account is permanent.
+  const mode = line(founder, new RegExp(` 324 ${account} ${chan} \\+Pnt$`))
+  founder.raw(`MODE ${chan}`)
+  await mode
+  const topic = once(founder, 'topic', (e) => e.channel === chan)
+  founder.setTopic(chan, 'Kept while nobody is here')
+  await topic
+  const echoes = []
+  for (const text of ['first', 'second']) {
+    const echoed = once(founder, 'privmsg', (e) => e.message === text)
+    founder.say(chan, text)
+    echoes.push(await echoed)
+  }
+  // A multiline message, from a raw client.
+  const raw = await rawClient('multi', ['batch', 'draft/multiline', 'echo-message', 'message-tags'])
+  raw.send(`JOIN ${chan}`)
+  await raw.waitFor(new RegExp(` 366 multi ${chan} `))
+  raw.send(
+    `BATCH +ml draft/multiline ${chan}`,
+    `@batch=ml PRIVMSG ${chan} :line one`,
+    `@batch=ml PRIVMSG ${chan} :line two`,
+    'BATCH -ml'
+  )
+  const multiline = await raw.waitFor(/ BATCH \+\S+ draft\/multiline /)
+  await raw.waitFor(/ BATCH -/)
+  raw.send('QUIT')
+  await new Promise((resolve) => raw.socket.once('close', resolve))
+  // Everyone leaves, and the founder comes back on another connection.
+  const closed = once(founder, 'close')
+  founder.quit('bye')
+  await closed
+  founder = await connect(account, caps, options)
+  names = once(founder, 'userlist', (e) => e.channel === chan)
+  const restored = once(founder, 'topic', (e) => e.channel === chan)
+  founder.join(chan)
+  assert.equal((await restored).topic, 'Kept while nobody is here')
+  assert.deepEqual(users(await names), [`o${account}`])
+  // irc-framework does not have draft/chathistory: it collects the batch, and the messages in it.
+  const batch = once(founder, 'batch end chathistory')
+  founder.raw(`CHATHISTORY LATEST ${chan} * 10`)
+  const { params, commands } = await batch
+  assert.deepEqual(params, [chan])
+  const played = commands.filter((c) => c.command === 'PRIVMSG')
+  // irc-framework does not have draft/multiline either: the lines of the multiline message.
+  assert.deepEqual(
+    played.map((c) => c.params[1]),
+    ['first', 'second', 'line one', 'line two']
+  )
+  assert.deepEqual(
+    played.slice(0, 2).map((c) => [c.tags.msgid, c.tags.time]),
+    echoes.map((e) => [e.tags.msgid, e.tags.time])
+  )
+  assert.equal(played[2].tags.msgid, /msgid=([^; ]+)/.exec(multiline)[1])
+  const before = once(founder, 'batch end chathistory')
+  founder.raw(`CHATHISTORY BEFORE ${chan} msgid=${echoes[1].tags.msgid} 10`)
+  assert.deepEqual(
+    (await before).commands.map((c) => c.params[1]),
+    ['first']
+  )
+  const targets = once(founder, 'batch end draft/chathistory-targets')
+  const later = new Date(Date.now() + 60_000).toISOString()
+  founder.raw(`CHATHISTORY TARGETS timestamp=2000-01-01T00:00:00.000Z timestamp=${later} 50`)
+  assert.ok((await targets).commands.some((c) => c.params[1] === chan))
+  const marked = line(founder, new RegExp(` MARKREAD ${chan} timestamp=`))
+  founder.raw(`MARKREAD ${chan} timestamp=${echoes[1].tags.time}`)
+  assert.ok((await marked).endsWith(`timestamp=${echoes[1].tags.time}`))
+  // alice is not in the channel.
+  const refused = line(alice, / FAIL CHATHISTORY INVALID_TARGET /)
+  alice.raw(`CHATHISTORY LATEST ${chan} * 10`)
+  await refused
+  founder.quit()
+})
+
 await step('quit', async () => {
   const quit = once(alice, 'quit')
   bob.quit('see ya')

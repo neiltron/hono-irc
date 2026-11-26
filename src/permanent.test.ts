@@ -141,7 +141,7 @@ describe('Restoring a permanent channel', () => {
     const directory = mkdtempSync(join(tmpdir(), 'hono-irc-'))
     directories.push(directory)
     const file = join(directory, 'irc.sqlite')
-    const caps = ['batch', 'server-time', 'message-tags', 'echo-message']
+    const caps = ['batch', 'server-time', 'message-tags', 'draft/chathistory', 'echo-message']
 
     let db = new DatabaseSync(file)
     const first = setup({ database: nodeStore(db) })
@@ -170,7 +170,7 @@ describe('Restoring a permanent channel', () => {
       '366 bob #a :End of /NAMES list',
     ])
     const founder = await second.user('alice', caps)
-    const lines = await transcript(founder, 'JOIN #a key', 'MODE #a')
+    const lines = await transcript(founder, 'JOIN #a key', 'MODE #a', 'CHATHISTORY LATEST #a * 10')
     expect(lines.map((line) => line.replace(/^(@\S+ )?:\S+ /, ''))).toEqual(
       expect.arrayContaining([
         '353 alice = #a :bob @alice',
@@ -178,7 +178,11 @@ describe('Restoring a permanent channel', () => {
         `329 alice #a ${created.params.at(-1)}`,
       ])
     )
-    expect(second.store.query('SELECT count(*) AS n FROM history')).toEqual([{ n: sent.length }])
+    // The messages, with their original times and msgids.
+    const replayed = lines.filter((line) => / PRIVMSG /.test(line))
+    expect(replayed.map((line) => parse(line)!.tags)).toEqual(
+      sent.map((line) => ({ batch: expect.any(String), ...parse(line)!.tags }))
+    )
     db.close()
   })
 })
