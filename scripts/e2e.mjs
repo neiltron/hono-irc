@@ -168,7 +168,7 @@ await step('registration and ISUPPORT', async () => {
   assert.ok(alice.network.supportsTag('typing'), 'CLIENTTAGDENY allows every client-only tag')
   assert.equal(alice.network.supports('AWAYLEN'), '300')
   assert.equal(alice.network.supports('CASEMAPPING'), 'ascii')
-  assert.deepEqual(alice.network.supports('CHANMODES'), ['beI', 'k', 'l', 'imnst'])
+  assert.deepEqual(alice.network.supports('CHANMODES'), ['beI', 'k', 'l', 'Pimnst'])
   for (const [token, value] of Object.entries({
     EXCEPTS: true,
     INVEX: true,

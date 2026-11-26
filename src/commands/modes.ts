@@ -7,6 +7,8 @@ import {
   ERR_NEEDMOREPARAMS,
   ERR_NOSUCHCHANNEL,
   ERR_NOSUCHNICK,
+  ERR_NOTONCHANNEL,
+  ERR_TOOMANYCHANNELS,
   ERR_UMODEUNKNOWNFLAG,
   ERR_UNKNOWNMODE,
   ERR_USERNOTINCHANNEL,
@@ -30,7 +32,6 @@ type Change = { adding: boolean; mode: string; arg?: string }
 // The channel modes by their type in CHANMODES, and the ranks of PREFIX.
 const LISTS = 'beI'
 const RANKS = 'ov'
-const SETTINGS = 'imnst'
 
 /** The replies that show a list: an entry and the end. */
 const LIST_REPLIES: Record<ListMode, [entry: string, end: string, text: string]> = {
@@ -132,7 +133,8 @@ export const modes = (server: Server) => {
       return c.render([ERR_NEEDMOREPARAMS, 'MODE', 'Not enough parameters'])
     }
 
-    const channel = server.channels.get(server.fold(targetName))
+    // A permanent channel that is empty shows its modes and lists too.
+    const channel = server.find(targetName)
     if (!channel) {
       if (targetName[0] === '#') {
         return c.render([ERR_NOSUCHCHANNEL, echo(targetName), 'No such channel'])
@@ -207,8 +209,24 @@ export const modes = (server: Server) => {
         }
         continue
       }
-      if (!takes && mode !== 'l' && !SETTINGS.includes(mode)) {
+      if (!takes && mode !== 'l' && !server.settings.includes(mode)) {
         lines.push([ERR_UNKNOWNMODE, echo(mode), 'is unknown mode char to me'])
+        continue
+      }
+      // Only the founder, logged in, makes the channel permanent or ordinary, from inside it.
+      if (mode === 'P') {
+        if (!channel.members.has(client)) {
+          lines.push([ERR_NOTONCHANNEL, channel.name, "You're not on that channel"])
+        } else if (!server.founds(client, channel)) {
+          lines.push([ERR_CHANOPRIVSNEEDED, channel.name, "You're not the channel founder"])
+        } else if (channel.permanent !== adding) {
+          if (adding && !server.channelStore!.allows(channel.founder!)) {
+            lines.push([ERR_TOOMANYCHANNELS, channel.name, 'Too many permanent channels'])
+          } else {
+            server.setPermanent(channel, adding)
+            changes.push({ adding, mode })
+          }
+        }
         continue
       }
       if (!operator) {
@@ -295,6 +313,9 @@ export const modes = (server: Server) => {
       }
     }
 
+    if (changes.some(({ mode }) => !RANKS.includes(mode))) {
+      server.persist(channel)
+    }
     if (changes.length) {
       announce(client, channel, changes)
     }

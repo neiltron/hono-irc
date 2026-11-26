@@ -1,4 +1,5 @@
 import type { Socket } from 'tcp-hono'
+import { hashPassword } from './accounts.ts'
 import { createServer } from './server.ts'
 import type { ServerOptions } from './server.ts'
 
@@ -93,9 +94,29 @@ export const setup = (config?: ServerOptions) => {
     await client.waitFor(/ 376 /)
     return client
   }
+  /**
+   * Connect a client with the capabilities, logged in with SASL to an account, which is made if it
+   * does not exist: the nickname by default, or none with `null`.
+   */
+  const user = async (nick: string, capabilities: string[] = [], account: string | null = nick) => {
+    const client = connect((socket) => server.connect(socket))
+    const lines = ['CAP LS 302', `CAP REQ :${['sasl', ...capabilities].join(' ')}`]
+    lines.push(`NICK ${nick}`, `USER ${nick} 0 * :${nick}`)
+    if (account !== null) {
+      if (!server.accounts!.get(account)) {
+        // Few iterations, so the tests are fast.
+        server.accounts!.create(account, await hashPassword('password1', 10), 'test')
+      }
+      const plain = Buffer.from(`${account}\0${account}\0password1`).toString('base64')
+      lines.push('AUTHENTICATE PLAIN', `AUTHENTICATE ${plain}`)
+    }
+    await client.send(...lines, 'CAP END')
+    await client.waitFor(/ 376 /)
+    return client
+  }
   /** The state of the server, which `createServer()` does not return. */
   const state = () => [...server.clients.values()][0]?.server
-  return { server, handler, register, state }
+  return { server, handler, register, user, state }
 }
 
 let sentinel = 0

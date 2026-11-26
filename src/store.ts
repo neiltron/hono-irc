@@ -124,6 +124,71 @@ export const MIGRATIONS: string[][] = [
     )`,
     'CREATE INDEX registrations_by_address ON registrations (address, at)',
   ],
+  [
+    // A permanent channel (+P), by its folded name. `name` is the name as it was created,
+    // `created` is in seconds (RPL_CREATIONTIME), `founder` is the folded name of the account of
+    // the founder, and `modes` are the modes of type D. `lists` is the JSON of the lists (+b, +e,
+    // +I): `[mode, mask, by, at]` for each entry. `history` is the target of its messages, and
+    // `used` the time in milliseconds when it was last joined or left, for the purge of the channels
+    // that nobody uses.
+    `CREATE TABLE channels (
+      folded TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      created INTEGER NOT NULL,
+      founder TEXT NOT NULL,
+      modes TEXT NOT NULL,
+      key TEXT,
+      max_members INTEGER,
+      topic TEXT,
+      topic_by TEXT,
+      topic_at INTEGER,
+      lists TEXT NOT NULL,
+      history INTEGER,
+      used INTEGER NOT NULL
+    )`,
+    'CREATE INDEX channels_by_founder ON channels (founder)',
+    'CREATE INDEX channels_by_use ON channels (used)',
+    // A conversation whose messages are stored: a channel, or the direct messages between two
+    // accounts, `low` and `high`, folded and in order. `ending` is NULL for a history that is kept,
+    // 0 for the one of an ordinary channel, which goes with the channel, and 1 for one to delete.
+    `CREATE TABLE targets (
+      id INTEGER PRIMARY KEY,
+      low TEXT,
+      high TEXT,
+      ending INTEGER
+    )`,
+    'CREATE UNIQUE INDEX targets_by_pair ON targets (low, high) WHERE low IS NOT NULL',
+    'CREATE INDEX targets_by_high ON targets (high) WHERE high IS NOT NULL',
+    'CREATE INDEX targets_by_ending ON targets (ending) WHERE ending IS NOT NULL',
+    // A PRIVMSG or a NOTICE, one row each, multiline or not. `id` is the order of storage, `msgid`
+    // sorts by time (see `Server.msgid()`), and `time` is the time of the msgid in milliseconds.
+    // `source` is the mask of the sender at the time, `account` its account, `recipient` the target
+    // as the recipients got it, `text` the text of a single line, or `lines` the JSON of the lines
+    // of a multiline message, and `tags` the JSON of the client-only tags.
+    `CREATE TABLE history (
+      id INTEGER PRIMARY KEY,
+      target INTEGER NOT NULL,
+      msgid TEXT NOT NULL,
+      time INTEGER NOT NULL,
+      command TEXT NOT NULL,
+      source TEXT NOT NULL,
+      account TEXT,
+      bot INTEGER NOT NULL,
+      recipient TEXT NOT NULL,
+      text TEXT,
+      lines TEXT,
+      tags TEXT
+    )`,
+    'CREATE UNIQUE INDEX history_by_target ON history (target, msgid)',
+    // The last message that an account has read in a target (draft/read-marker): a folded channel
+    // name, or the folded name of the other account. `at` is in milliseconds.
+    `CREATE TABLE read_markers (
+      account TEXT NOT NULL,
+      target TEXT NOT NULL,
+      at INTEGER NOT NULL,
+      PRIMARY KEY (account, target)
+    ) WITHOUT ROWID`,
+  ],
 ]
 
 /**

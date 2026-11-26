@@ -61,7 +61,8 @@ export const channels = (server: Server) => {
         c.render([ERR_NOSUCHCHANNEL, echo(channelName), 'No such channel'])
         continue
       }
-      let channel = server.channels.get(server.fold(channelName))
+      const folded = server.fold(channelName)
+      let channel = server.channels.get(folded)
       if (channel?.members.has(client)) {
         continue
       }
@@ -69,7 +70,9 @@ export const channels = (server: Server) => {
         c.render([ERR_TOOMANYCHANNELS, channelName, 'You have joined too many channels'])
         continue
       }
-      const refused = channel?.canJoin(client, keys[i] || undefined)
+      // A permanent channel that is empty is restored as it was, and its rules apply.
+      const stored = channel ? undefined : server.restore(channelName)
+      const refused = (channel ?? stored)?.canJoin(client, keys[i] || undefined)
       if (refused) {
         c.render(refused)
         continue
@@ -81,11 +84,26 @@ export const channels = (server: Server) => {
           c.render([ERR_CHANNELISFULL, channelName, 'Cannot join channel (too many channels)'])
           continue
         }
-        channel = new Channel(channelName)
-        server.channels.set(server.fold(channelName), channel)
+        if (stored) {
+          channel = stored
+          server.channelStore!.touch(folded)
+        } else {
+          channel = new Channel(channelName)
+          // The account of the client founds the channel, which is permanent if it may be.
+          if (client.account !== undefined) {
+            channel.founder = server.fold(client.account)
+            if (server.persistChannels && server.channelStore?.allows(channel.founder)) {
+              server.setPermanent(channel, true)
+            }
+          }
+        }
+        server.channels.set(folded, channel)
       }
-      // The first member is the operator.
-      channel.members.set(client, new Set(channel.members.size ? [] : ['o']))
+      // The first member is the operator, but in a permanent channel only the founder is, whenever
+      // it joins.
+      const operator = channel.permanent ? server.founds(client, channel) : !channel.members.size
+      channel.members.set(client, new Set(operator ? ['o'] : []))
+      channel.joined.set(client, server.msgid())
       client.channels.add(channel)
       // An invite is used up.
       server.uninvite(client, channel)
@@ -105,6 +123,9 @@ export const channels = (server: Server) => {
       }
       if (channel.topic) {
         c.render(...server.topic(channel))
+      }
+      for (const hook of server.onJoin) {
+        hook(client, channel)
       }
       if (!client.capabilities.has('no-implicit-names')) {
         c.render(...server.names(client, channel))
@@ -143,7 +164,8 @@ export const channels = (server: Server) => {
     if (!channelName) {
       return c.render([ERR_NEEDMOREPARAMS, 'TOPIC', 'Not enough parameters'])
     }
-    const channel = server.channels.get(server.fold(channelName))
+    // A permanent channel that is empty has its topic too.
+    const channel = server.find(channelName)
     if (!channel) {
       return c.render([ERR_NOSUCHCHANNEL, echo(channelName), 'No such channel'])
     }
@@ -165,6 +187,7 @@ export const channels = (server: Server) => {
           at: Math.floor(Date.now() / 1000),
         }
       : undefined
+    server.persist(channel)
     channel.send(msg(client.mask, 'TOPIC', channel.name, channel.topic?.text ?? ''))
     return c.render()
   })
@@ -188,7 +211,12 @@ export const channels = (server: Server) => {
     )
   })
 
+  // The channels with members, and then the permanent channels that are empty, with 0 users. A
+  // secret channel is only listed to its members, so an empty one never is.
   app.on('TCP', '/LIST/*', (c) => {
+    const empty = (server.channelStore?.listed() ?? []).filter(
+      ({ folded }) => !server.channels.has(folded)
+    )
     return c.render(
       [RPL_LISTSTART, 'Channel', 'Users  Name'],
       ...[...server.channels.values()]
@@ -199,6 +227,7 @@ export const channels = (server: Server) => {
           channel.members.size,
           channel.topic?.text ?? '',
         ]),
+      ...empty.map(({ name, topic }): Line => [RPL_LIST, name, 0, topic ?? '']),
       [RPL_LISTEND, 'End of /LIST']
     )
   })

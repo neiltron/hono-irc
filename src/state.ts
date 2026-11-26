@@ -31,8 +31,12 @@ import {
 } from './numerics.ts'
 import { Accounts } from './accounts.ts'
 import type { AccountOptions } from './accounts.ts'
+import { ChannelStore } from './channels-store.ts'
+import type { PermanentOptions, StoredEntry } from './channels-store.ts'
 import { cloak } from './cloak.ts'
-import { matches } from './masks.ts'
+import { CROCKFORD, History, encodeTime } from './history.ts'
+import type { HistoryOptions } from './history.ts'
+import { compile, matches } from './masks.ts'
 import type { Glob } from './masks.ts'
 import { MAX_LINE_LENGTH, MAX_TAG_DATA, byteLength, format, tagsLength } from './protocol.ts'
 import type { IRCMessage } from './protocol.ts'
@@ -96,6 +100,20 @@ export type ServerOptions = {
   database?: Store | false
   /** The accounts, their registration, and their limits. */
   accounts?: AccountOptions
+  /**
+   * Whether a channel that a client logged in to an account creates is permanent (+P), with the
+   * account as its founder. Needs a database.
+   */
+  persistChannels?: boolean
+  /** The limits of the permanent channels. */
+  permanentChannels?: PermanentOptions
+  /** The history of the messages (draft/chathistory), which needs a database. */
+  history?: HistoryOptions
+  /**
+   * The number of stored messages that a client gets when it joins a channel, if it does not have
+   * draft/chathistory to ask for them. 0, by default, sends none.
+   */
+  replayOnJoin?: number
 }
 
 /** The limits of a `draft/multiline` batch, which `CAP LS 302` shows. */
@@ -130,7 +148,6 @@ export type ConnectionInfo = {
 }
 
 export const VERSION = 'hono-irc-0.0.1'
-const CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
 // The lengths are in bytes of UTF-8.
 export const NICK_LENGTH = 30
 export const CHANNEL_LENGTH = 50
@@ -256,6 +273,38 @@ export const clientTags = (tags?: Record<string, string>): Record<string, string
  */
 export type SaslSession = { mechanism: string; response: string }
 
+/** A line of a multiline message, and whether it is joined to the line before it. */
+export type MultilineLine = { text: string; concat: boolean }
+
+/**
+ * A message from a user to one target, as it is delivered, stored, and played back. `time` is the
+ * time of its `msgid` in milliseconds. `account` and `bot` are those of the sender when it was
+ * sent: a message that is played back has them as tags, and a live one gets the tags from the
+ * sender as it is (`Server.sourceTags()`).
+ */
+export type Chat = {
+  msgid: string
+  time: number
+  command: 'PRIVMSG' | 'NOTICE' | 'TAGMSG'
+  /** The mask of the sender. */
+  source: string
+  account?: string
+  bot?: boolean
+  /** The target as the recipients get it: the name of the channel, or the nickname. */
+  target: string
+  /** The text of one line, or the lines of a multiline message. TAGMSG has neither. */
+  text?: string
+  lines?: MultilineLine[]
+  /** The client-only tags. */
+  tags: Record<string, string>
+}
+
+/**
+ * A tag of the server that marks a message whose tags are complete, such as one that is played
+ * back: `Server.sourceTags()` adds nothing to it. No capability owns it, so it is never sent.
+ */
+export const VERBATIM = 'hono-irc/verbatim'
+
 /** A message to the client during its own command, and whether it is part of the response. */
 export type OutboxEntry = { message: IRCMessage; response: boolean }
 
@@ -377,12 +426,17 @@ export class Client {
    * Send messages as one batch: `BATCH +ref type params`, the messages with the `batch` tag, and
    * `BATCH -ref`, with `tags`, such as `msgid`, on the `BATCH +` line. A client without `batch`
    * gets the messages alone, with `tags` on the first one.
+   *
+   * `parent` is the reference of a batch that this one is nested in, such as a `chathistory` batch:
+   * the `BATCH` lines have it, and the messages have the reference of this one.
    */
   sendBatch(
     batch: { source: string; type: string; params?: string[]; tags?: Record<string, string> },
     messages: IRCMessage[],
-    response = true
+    response = true,
+    parent?: string
   ) {
+    const outer: Record<string, string> = parent === undefined ? {} : { batch: parent }
     if (!this.capabilities.has('batch')) {
       messages.forEach((message, i) => {
         this.send(i ? message : { ...message, tags: { ...batch.tags, ...message.tags } }, response)
@@ -391,12 +445,21 @@ export class Client {
     }
     const ref = this.reference()
     const { source, type, params = [], tags } = batch
-    this.send({ tags, source, command: 'BATCH', params: ['+' + ref, type, ...params] }, response)
+    this.send(
+      {
+        tags: { ...outer, ...tags },
+        source,
+        command: 'BATCH',
+        params: ['+' + ref, type, ...params],
+      },
+      response
+    )
     for (const message of messages) {
       this.send({ ...message, tags: { batch: ref, ...message.tags } }, response)
     }
     const end = { source, command: 'BATCH', params: ['-' + ref] }
-    this.send(tags?.time ? { ...end, tags: { time: tags.time } } : end, response)
+    const time: Record<string, string> = tags?.time === undefined ? {} : { time: tags.time }
+    this.send({ ...end, tags: { ...outer, ...time } }, response)
   }
 
   /**
@@ -457,6 +520,20 @@ export class Channel {
   lists: Record<ListMode, ListEntry[]> = { b: [], e: [], I: [] }
   /** The clients that are invited, until they join. `Client.invites` is the other side. */
   invited = new Set<Client>()
+  /** The folded name of the account of the client that created the channel, if it had one. */
+  founder?: string
+  /** The target of the stored messages of the channel, once it has one (see `History`). */
+  history?: number
+  /**
+   * A msgid made when each member joined, which sorts after every message before. In a channel that
+   * is not permanent, a member reads the history from there on.
+   */
+  joined = new Map<Client, string>()
+
+  /** Whether the channel is permanent (+P): it is stored, and stays when it is empty. */
+  get permanent() {
+    return this.modes.has('P')
+  }
 
   /** Whether the client matches a mask of a list. */
   matches(mode: ListMode, client: Client) {
@@ -618,6 +695,20 @@ export class Server {
   store?: Store
   /** The accounts, if the server has a database. */
   accounts?: Accounts
+  /** The permanent channels, if the server has a database. */
+  channelStore?: ChannelStore
+  /** The stored messages and read markers, if the server has a database. */
+  history?: History
+  persistChannels: boolean
+  replayOnJoin: number
+  /** The channel modes of type D, which `P` is one of with a database. */
+  settings: string
+
+  /**
+   * What a feature sends to a client that joins a channel, after the JOIN and the topic, and
+   * before the names, such as its read marker. A hook sends with `client.send()`.
+   */
+  onJoin: ((client: Client, channel: Channel) => void)[] = []
 
   constructor(config: ServerOptions = {}) {
     this.name = config.name ?? 'irc.hono.local'
@@ -636,6 +727,8 @@ export class Server {
               PART: 2,
               AUTHENTICATE: 2,
               REGISTER: 3,
+              // A request reads up to `history.limit` messages, and plays them back.
+              CHATHISTORY: 2,
             },
           }
     this.maxConnections = config.maxConnections ?? 1000
@@ -656,12 +749,17 @@ export class Server {
       migrate(store)
       this.store = store
       this.accounts = new Accounts(store, (name) => this.fold(name), config.accounts)
+      this.channelStore = new ChannelStore(store, config.permanentChannels)
+      this.history = new History(store, config.history)
     }
+    this.persistChannels = config.persistChannels ?? true
+    this.replayOnJoin = config.replayOnJoin ?? 0
+    this.settings = store ? 'Pimnst' : 'imnst'
     this.isupport = new Map<string, string | true>([
       ['CASEMAPPING', 'ascii'],
       ['CHANTYPES', '#'],
       // The lists, the key, the limit, and the modes without a parameter.
-      ['CHANMODES', 'beI,k,l,imnst'],
+      ['CHANMODES', `beI,k,l,${this.settings}`],
       ['EXCEPTS', true],
       ['INVEX', true],
       ['MAXLIST', `beI:${MAX_LIST}`],
@@ -702,6 +800,14 @@ export class Server {
    * part of the last one is increased by one, so they stay unique and in order in a process.
    */
   msgid(): string {
+    return this.stamp().msgid
+  }
+
+  /**
+   * A new message ID and its time in milliseconds, which is the `time` tag of the message. The time
+   * never goes back in a process, so the order of the IDs is the order of the times.
+   */
+  stamp(): { msgid: string; time: number } {
     const now = Date.now()
     const random = this.#msgRandom
     if (now > this.#msgTime) {
@@ -712,10 +818,7 @@ export class Server {
         random[i] = 0
       }
     }
-    let id = ''
-    for (let time = this.#msgTime, i = 0; i < 10; i++, time = Math.floor(time / 32)) {
-      id = CROCKFORD[time % 32] + id
-    }
+    let id = encodeTime(this.#msgTime)
     // 80 bits are 16 characters of 5 bits.
     let bits = 0
     let value = 0
@@ -727,7 +830,7 @@ export class Server {
         id += CROCKFORD[(value >> bits) & 31]
       }
     }
-    return id
+    return { msgid: id, time: this.#msgTime }
   }
 
   /** CASEMAPPING=ascii: only A to Z are folded, so a name with other letters stays as it is. */
@@ -777,6 +880,7 @@ export class Server {
 
   leave(client: Client, channel: Channel) {
     channel.members.delete(client)
+    channel.joined.delete(client)
     client.channels.delete(channel)
     if (!channel.members.size) {
       this.channels.delete(this.fold(channel.name))
@@ -785,7 +889,163 @@ export class Server {
         invited.invites.delete(channel)
       }
       channel.invited.clear()
+      // A permanent channel stays stored, with its history. The history of another one goes.
+      if (channel.permanent) {
+        this.channelStore?.touch(this.fold(channel.name))
+      } else if (channel.history !== undefined) {
+        this.history?.setEnding(channel.history, 1)
+      }
     }
+  }
+
+  /**
+   * A channel from the store, as it was when it was last changed, if it is permanent. It is not
+   * added to the channels: the caller does, when a client joins it.
+   */
+  restore(name: string): Channel | undefined {
+    const row = this.channelStore?.get(this.fold(name))
+    if (!row) {
+      return
+    }
+    const channel = new Channel(row.name)
+    channel.created = row.created
+    channel.founder = row.founder
+    channel.modes = new Set(row.modes)
+    channel.key = row.key ?? undefined
+    channel.limit = row.max_members ?? undefined
+    if (row.topic !== null) {
+      channel.topic = { text: row.topic, by: row.topic_by ?? '', at: row.topic_at ?? 0 }
+    }
+    for (const [mode, mask, by, at] of JSON.parse(row.lists) as StoredEntry[]) {
+      channel.lists[mode].push({ mask, by, at, glob: compile(this.fold(mask)) })
+    }
+    channel.history = row.history ?? undefined
+    return channel
+  }
+
+  /**
+   * A channel by its name: one that has members, or a permanent one that is empty, which is not
+   * added to the channels. A secret one that is empty is left out, as nobody is in it.
+   */
+  find(name: string): Channel | undefined {
+    const channel = this.channels.get(this.fold(name)) ?? this.restore(name)
+    return channel && (channel.members.size || !channel.modes.has('s')) ? channel : undefined
+  }
+
+  /** Write the state of a channel to the store, if it is permanent and has members. */
+  persist(channel: Channel) {
+    if (channel.permanent && this.channels.get(this.fold(channel.name)) === channel) {
+      this.channelStore?.save(this.fold(channel.name), channel)
+    }
+  }
+
+  /**
+   * The account that a nickname stands for, as a target of the history or of a read marker: the
+   * account of the client that has the nickname, or else the account of that name. `name` is the
+   * nickname of that client, or the name of the account.
+   */
+  accountOf(nick: string): { folded: string; name: string } | undefined {
+    const online = this.nicks.get(this.fold(nick))
+    if (online?.registered && online.account !== undefined) {
+      return { folded: this.fold(online.account), name: online.nick }
+    }
+    const account = this.accounts?.get(nick)
+    return account && { folded: account.folded, name: account.name }
+  }
+
+  /** Whether the client is logged in to the account that founded the channel. */
+  founds(client: Client, channel: Channel) {
+    return (
+      channel.founder !== undefined &&
+      client.account !== undefined &&
+      this.fold(client.account) === channel.founder
+    )
+  }
+
+  /**
+   * Make a channel permanent, or ordinary. A permanent one is stored, and its history kept; an
+   * ordinary one is deleted from the store, and its history goes when the channel does. One
+   * transaction.
+   */
+  setPermanent(channel: Channel, permanent: boolean) {
+    const store = this.channelStore!
+    const folded = this.fold(channel.name)
+    this.store!.transaction(() => {
+      if (permanent) {
+        channel.modes.add('P')
+        store.insert(folded, channel)
+      } else {
+        channel.modes.delete('P')
+        store.remove(folded)
+      }
+      if (channel.history !== undefined) {
+        this.history!.setEnding(channel.history, permanent ? null : 0)
+      }
+    })
+  }
+
+  /**
+   * Delete a bounded amount of what has expired: the permanent channels that nobody has joined for
+   * `permanentChannels.expire`, with their histories, and old messages (see `History.sweep()`).
+   */
+  expire(now = Date.now()) {
+    const store = this.channelStore
+    const history = this.history
+    if (!store || !history) {
+      return
+    }
+    for (const { folded, history: target } of store.expired(now, 10)) {
+      // A channel with members is in use, whatever the store says.
+      if (this.channels.has(folded)) {
+        store.touch(folded, now)
+        continue
+      }
+      this.store!.transaction(() => {
+        store.remove(folded)
+        if (target !== null) {
+          history.setEnding(target, 1)
+        }
+      })
+    }
+    history.sweep(now)
+  }
+
+  /**
+   * Store a message of a channel in its history, which is made with the first message.
+   */
+  record(channel: Channel, chat: Chat) {
+    const history = this.history
+    if (!history || chat.command === 'TAGMSG') {
+      return
+    }
+    this.store!.transaction(() => {
+      if (channel.history === undefined) {
+        channel.history = history.createTarget(channel.permanent)
+        if (channel.permanent) {
+          this.channelStore!.setHistory(this.fold(channel.name), channel.history)
+        }
+      }
+      history.add(channel.history, chat)
+    })
+  }
+
+  /**
+   * Store a direct message, if both ends are logged in to accounts: its history is the one of the
+   * two accounts, whatever their nicknames and connections.
+   */
+  recordDirect(sender: Client, recipient: Client, chat: Chat) {
+    const history = this.history
+    if (!history || chat.command === 'TAGMSG' || !sender.account || !recipient.account) {
+      return
+    }
+    this.store!.transaction(() => {
+      const target = history.direct(
+        this.fold(sender.account!),
+        this.fold(recipient.account!),
+        true
+      )!
+      history.add(target, chat)
+    })
   }
 
   /** Invite a client to a channel. A client keeps the last MAX_INVITES invites. */
@@ -891,7 +1151,7 @@ export class Server {
    */
   sourceTags(message: IRCMessage): IRCMessage {
     const bang = message.source?.indexOf('!') ?? -1
-    if (bang < 1) {
+    if (bang < 1 || message.tags?.[VERBATIM] !== undefined) {
       return message
     }
     const sender = this.nicks.get(this.fold(message.source!.slice(0, bang)))
@@ -1071,7 +1331,14 @@ export class Server {
       [RPL_YOURHOST, `Your host is ${this.name}, running version ${VERSION}`],
       [RPL_CREATED, `This server was created ${this.created.toUTCString()}`],
       // The user modes, the channel modes, and the channel modes that have a parameter.
-      [RPL_MYINFO, this.name, VERSION, 'Bi', 'Ibeiklmnostv', 'Ibeklov'],
+      [
+        RPL_MYINFO,
+        this.name,
+        VERSION,
+        'Bi',
+        `Ibeklov${this.settings}`.split('').sort().join(''),
+        'Ibeklov',
+      ],
       ...this.isupportLines(),
       ...this.lusers(),
       ...this.motdLines(),

@@ -359,9 +359,17 @@ export const createServer = (config: ServerOptions = {}) => {
     }
   }
 
-  /** Find the clients that have gone without closing the connection. Call it periodically. */
+  /**
+   * Find the clients that have gone without closing the connection, and delete a bounded number of
+   * old messages and unused permanent channels. Call it periodically.
+   */
   const tick = () => {
     const now = Date.now()
+    try {
+      server.expire(now)
+    } catch (error) {
+      console.error(error)
+    }
     for (const client of server.clients.values()) {
       expire(server, client, now)
       // A client whose command waits for the flood control has sent something, which is handled

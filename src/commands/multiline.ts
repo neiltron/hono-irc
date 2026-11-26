@@ -4,10 +4,9 @@ import { INPUT_TOO_LONG, byteLength } from '../protocol.ts'
 import type { IRCMessage } from '../protocol.ts'
 import { MAX_TARGETS, clientTags, echo, fail, msg, tooMany } from '../state.ts'
 import type { Client, Env, InboundBatch, Line, Server } from '../state.ts'
-import { deliver } from './messages.ts'
+import { CONCAT, MULTILINE, deliver } from './messages.ts'
 
-const TYPE = 'draft/multiline'
-const CONCAT = 'draft/multiline-concat'
+const TYPE = MULTILINE
 // A reference tag has only ASCII letters, digits, and hyphens.
 const REF_PATTERN = /^[A-Za-z0-9-]+$/
 
@@ -216,39 +215,15 @@ export const multiline = (server: Server) => {
     return c.render(...send(client, batch, batch.command))
   })
 
-  // Deliver a batch, with the checks of PRIVMSG done once for the whole message.
+  // Deliver a batch, with the checks of PRIVMSG done once for the whole message, as one message:
+  // one msgid, and one row of the history.
   const send = (client: Client, batch: InboundBatch, command: 'PRIVMSG' | 'NOTICE') => {
-    const content = batch.lines
     const { targets, excess } = server.targets(batch.target, MAX_TARGETS[command])
     client.idle = Date.now()
     const lines: Line[] = []
     for (const targetName of targets) {
-      // The same ID and time for every recipient, on the batch or on its first line.
-      const tags = { time: new Date().toISOString(), msgid: server.msgid(), ...batch.tags }
-      const line = (target: string, text: string, extra?: Record<string, string>): IRCMessage => ({
-        tags: { time: tags.time, ...extra },
-        source: client.mask,
-        command,
-        params: [target, text],
-      })
       lines.push(
-        ...deliver(server, client, targetName, (recipient, target, response) => {
-          if (recipient.capabilities.has(TYPE) && recipient.capabilities.has('batch')) {
-            recipient.sendBatch(
-              { source: client.mask, type: TYPE, params: [target], tags },
-              content.map(({ text, concat }) => line(target, text, concat ? { [CONCAT]: '' } : {})),
-              response
-            )
-            return
-          }
-          // The fallback keeps the lines as the client split them, without the blank ones. The tags
-          // of the batch, the message ID among them, are on the first line only.
-          content
-            .filter(({ text }) => text)
-            .forEach(({ text }, i) => {
-              recipient.send(i ? line(target, text) : line(target, text, tags), response)
-            })
-        })
+        ...deliver(server, client, targetName, { command, lines: batch.lines, tags: batch.tags })
       )
     }
     lines.push(...tooMany(excess))

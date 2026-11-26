@@ -24,7 +24,7 @@ describe('Advertised modes', () => {
       .flatMap((line) => line.split(' ').slice(3, -4))
     expect(tokens).toEqual(
       expect.arrayContaining([
-        'CHANMODES=beI,k,l,imnst',
+        'CHANMODES=beI,k,l,Pimnst',
         'PREFIX=(ov)@+',
         'EXCEPTS',
         'INVEX',
@@ -34,7 +34,7 @@ describe('Advertised modes', () => {
       ])
     )
     expect(alice.lines.find((line) => / 004 /.test(line))).toMatch(
-      / 004 alice irc\.hono\.local \S+ \S+ Ibeiklmnostv Ibeklov$/
+      / 004 alice irc\.hono\.local \S+ \S+ IPbeiklmnostv Ibeklov$/
     )
   })
 })

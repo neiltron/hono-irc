@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vite-plus/test'
+import { parse } from './protocol.ts'
 import { createServer } from './server.ts'
 import { connect, exchange, isupport, setup } from './test-utils.ts'
 
@@ -42,7 +43,9 @@ describe('Registration', () => {
     const { handler } = setup()
     const client = connect(handler)
     await client.send('CAP LS 302', 'NICK alice', 'USER alice 0 * :Alice A')
-    expect(await client.waitFor(/ CAP /)).toMatch(/ CAP \* LS :.*server-time/)
+    // The capabilities take more than one line: `*` on each but the last one.
+    await client.waitFor(/ CAP \* LS (?!\* )/)
+    expect(client.lines.filter((line) => / CAP \* LS /.test(line)).join(' ')).toMatch(/server-time/)
     await client.send('CAP REQ :server-time no-such-capability')
     expect(await client.waitFor(/ CAP /)).toContain('CAP alice NAK :server-time no-such-capability')
     await client.send('CAP REQ :server-time echo-message')
@@ -294,7 +297,7 @@ describe('Advertised features', () => {
       expect(line.split(' ').slice(3, -5).length).toBeLessThanOrEqual(13)
     }
     expect(alice.lines.find((line) => / 004 /.test(line))).toMatch(
-      / 004 alice irc\.hono\.local \S+ Bi Ibeiklmnostv Ibeklov$/
+      / 004 alice irc\.hono\.local \S+ Bi IPbeiklmnostv Ibeklov$/
     )
   })
 
@@ -304,8 +307,9 @@ describe('Advertised features', () => {
     await client.send('CAP LS 302', 'CAP LS', 'PING :done')
     await client.waitFor(/ PONG /)
     const lines = client.lines.filter((line) => / CAP \* LS /.test(line))
+    // The last parameter of each line, after `*` on the lines that are followed by more.
     const caps = (version: string[]) =>
-      version.flatMap((line) => line.slice(line.indexOf(' :') + 2).split(' '))
+      version.flatMap((line) => parse(line)!.params.at(-1)!.split(' '))
     const latest = caps(lines.slice(0, -1)).map((cap) => cap.split('=')[0])
     expect(new Set(latest).size).toBe(latest.length)
     expect([...latest].sort()).toEqual([
@@ -348,7 +352,10 @@ describe('Registries', () => {
     expect(names).toMatch(/ CAP \* LS :.*\bsasl\b/)
     expect(names).not.toContain('sasl=')
     await client.send('CAP LS 302')
-    expect(await client.waitFor(/ CAP /)).toMatch(/ CAP \* LS :.* sasl=PLAIN,EXTERNAL /)
+    await client.waitFor(/ CAP \* LS (?!\* )/)
+    expect(client.lines.filter((line) => / CAP \* LS \S/.test(line)).join('\n')).toMatch(
+      / sasl=PLAIN,EXTERNAL /
+    )
     await client.send('CAP REQ :sasl', 'CAP REQ :sasl=PLAIN')
     expect(await client.waitFor(/ CAP /)).toContain('CAP * ACK sasl')
     expect(await client.waitFor(/ CAP /)).toContain('CAP * NAK sasl=PLAIN')
