@@ -40,6 +40,8 @@ export const connect = (handler: (socket: Socket) => Promise<void>) => {
     closed,
     send: (...messages: string[]) =>
       writer.write(encoder.encode(messages.map((message) => message + '\r\n').join(''))),
+    /** Send raw bytes, such as a line that is not UTF-8. */
+    sendBytes: (bytes: Uint8Array) => writer.write(bytes),
     /** Wait for the next line that matches the pattern. The lines before it are skipped. */
     waitFor: async (pattern: RegExp, timeout = 1000): Promise<string> => {
       const deadline = Date.now() + timeout

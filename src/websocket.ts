@@ -72,7 +72,10 @@ const LF = 10
 const CLOSED = 3
 const encoder = new TextEncoder()
 // Not fatal: a byte sequence that is not UTF-8 becomes U+FFFD in a text message, which the spec
-// allows. A browser closes the connection on a text message that is not UTF-8.
+// allows. A browser closes the connection on a text message that is not UTF-8. The IRC server
+// advertises UTF8ONLY and sends only UTF-8, so this does not happen with it: a line from a client
+// that is not UTF-8, which only the binary subprotocol can carry, is rejected with FAIL and not
+// relayed, as over TCP.
 const decoder = new TextDecoder()
 
 /**

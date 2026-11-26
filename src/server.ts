@@ -11,12 +11,17 @@ import { flood } from './flood.ts'
 import { ERR_INPUTTOOLONG, ERR_NOTREGISTERED, ERR_UNKNOWNCOMMAND } from './numerics.ts'
 import { INPUT_TOO_LONG, byteLength, format, irc, parse, parseTags } from './protocol.ts'
 import type { IRCMessage } from './protocol.ts'
-import { Client, Server, msg } from './state.ts'
+import { Client, Server, fail, msg } from './state.ts'
 import type { ConnectionInfo, Env, Line, OutboxEntry, ServerOptions } from './state.ts'
 
 export type { ConnectionInfo, ServerOptions }
 
 const TOO_LONG_PATH = '/' + encodeURIComponent(INPUT_TOO_LONG)
+
+// UTF8ONLY: a line from a client must be UTF-8. The one that is not is decoded with U+FFFD only to
+// know its command and its label for the reply.
+const strict = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false })
+const lenient = new TextDecoder()
 
 /** The max length of a label in bytes, as labeled-response says. */
 const MAX_LABEL_LENGTH = 64
@@ -111,9 +116,18 @@ export const createServer = (config: ServerOptions = {}) => {
       return c.body(null)
     }
     // A line that was too long comes with its tags at most, and the rest are lines that parse.
-    const text = await c.req.text()
+    const bytes = new Uint8Array(await c.req.arrayBuffer())
     const tooLong = c.req.path === TOO_LONG_PATH
-    const message: IRCMessage = (tooLong
+    let utf8 = true
+    let text: string
+    try {
+      text = strict.decode(bytes)
+    } catch {
+      // The tags of a line that is too long are just dropped, and it gets its reply.
+      utf8 = tooLong
+      text = tooLong ? '' : lenient.decode(bytes)
+    }
+    let message: IRCMessage = (tooLong
       ? { ...(text && { tags: parseTags(text.slice(1)) }), command: INPUT_TOO_LONG, params: [] }
       : parse(text)) ?? { command: INPUT_TOO_LONG, params: [] }
     // A client that has labeled-response and batch gets its label back. A label must not be longer
@@ -125,6 +139,10 @@ export const createServer = (config: ServerOptions = {}) => {
       client.capabilities.has('batch')
         ? message.tags.label
         : undefined
+    if (!utf8 && message.command === 'QUIT') {
+      // A client that quits is let go, without its reason.
+      message = { ...message, params: [] }
+    }
     client.active = Date.now()
     client.pinged = false
     c.set('client', client)
@@ -159,7 +177,24 @@ export const createServer = (config: ServerOptions = {}) => {
     client.outbox = outbox
     let handled: Promise<void> | undefined
     try {
-      if (!client.registered && !server.beforeRegistration.has(message.command)) {
+      if (!utf8 && message.command !== 'QUIT') {
+        // The line is not relayed, and the client stays. If it was part of a multiline batch, the
+        // batch has lost a line, so it fails too.
+        const command = /^[A-Za-z0-9]+$/.test(message.command) ? message.command : '*'
+        c.render(
+          fail(
+            command,
+            'INVALID_UTF8',
+            'Message rejected, your IRC software MUST use UTF-8 encoding on this network'
+          )
+        )
+        if (client.inbound && client.inbound.ref === message.tags?.batch) {
+          client.inbound = undefined
+          c.render(
+            fail('BATCH', 'MULTILINE_INVALID', 'Invalid multiline batch with a line not UTF-8')
+          )
+        }
+      } else if (!client.registered && !server.beforeRegistration.has(message.command)) {
         c.render([ERR_NOTREGISTERED, 'You have not registered'])
       } else {
         handled = next()

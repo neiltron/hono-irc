@@ -238,6 +238,28 @@ describe('fromWebSocket()', () => {
     expect(ws.closed).toEqual({ code: 1009, reason: 'Message too long' })
   })
 
+  it('Should reject a line that is not UTF-8 with the binary subprotocol', async () => {
+    const server = createServer({ name: 'irc.example', flood: false })
+    const ws = new FakeWebSocket()
+    void server.connect(fromWebSocket(ws, { protocol: BINARY }), {})
+    ws.receive(bytes('NICK alice').buffer)
+    ws.receive(bytes('USER alice 0 * :Alice').buffer)
+    await expect
+      .poll(() => ws.sent.some((m) => decoder.decode(m as Uint8Array).includes(' 376 ')))
+      .toBe(true)
+    ws.receive(new Uint8Array([...bytes('PRIVMSG alice :caf'), 0xe9]).buffer)
+    ws.receive(bytes('PRIVMSG alice :café').buffer)
+    await expect.poll(() => ws.sent.length).toBeGreaterThan(0)
+    await expect
+      .poll(() => decoder.decode(ws.sent.at(-1) as Uint8Array))
+      .toMatch(/ PRIVMSG alice café$/)
+    const replies = ws.sent.slice(-2).map((m) => decoder.decode(m as Uint8Array))
+    expect(replies[0]).toBe(
+      ':irc.example FAIL PRIVMSG INVALID_UTF8 :Message rejected, your IRC software MUST use UTF-8 encoding on this network'
+    )
+    expect(ws.closed).toBeUndefined()
+  })
+
   it('Should serve an IRC client', async () => {
     const server = createServer({ name: 'irc.example' })
     const ws = new FakeWebSocket()

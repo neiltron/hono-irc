@@ -480,6 +480,7 @@ export class Server {
       ],
       // Every client-only tag is allowed. The token is empty, which means the same as no token.
       ['CLIENTTAGDENY', ''],
+      ['UTF8ONLY', true],
     ])
   }
 

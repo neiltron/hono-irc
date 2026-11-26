@@ -7,7 +7,7 @@ import { Client, Server, fail, msg } from './state.ts'
 import { connect } from './test-utils.ts'
 
 // The IRCv3 extensions around message tags: message-tags, message-ids, batch, labeled-response,
-// standard-replies, and draft/multiline.
+// standard-replies, draft/multiline, and UTF8ONLY.
 
 const setup = (config?: ServerOptions) => {
   const server = createServer({ name: 'irc.example', flood: false, ...config })
@@ -28,6 +28,7 @@ const setup = (config?: ServerOptions) => {
 type TestClient = ReturnType<typeof connect>
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+const encoder = new TextEncoder()
 
 let sentinel = 0
 
@@ -75,6 +76,7 @@ describe('Registries of the IRCv3 extensions', () => {
     const alice = await register('alice')
     const tokens = alice.lines.filter((line) => / 005 /.test(line)).join(' ')
     expect(tokens).toContain(' CLIENTTAGDENY= ')
+    expect(tokens).toContain(' UTF8ONLY ')
   })
 
   it('Should not enforce the order of the capabilities that depend on batch', async () => {
@@ -679,7 +681,7 @@ describe('draft/multiline', () => {
     expect(bob.lines.filter((line) => / PRIVMSG /.test(line))).toEqual([])
   })
 
-  it('Should fail a batch that has a line too long', async () => {
+  it('Should fail a batch that has a line too long or not UTF-8', async () => {
     const { register } = setup()
     const alice = await register('alice', MULTILINE)
     await register('bob')
@@ -693,6 +695,16 @@ describe('draft/multiline', () => {
     ).toEqual([
       ':irc.example 417 alice :Input line was too long',
       ':irc.example FAIL BATCH MULTILINE_INVALID :Invalid multiline batch with a line too long',
+    ])
+    const mark = alice.lines.length
+    await alice.send('BATCH +b draft/multiline bob')
+    await alice.sendBytes(
+      new Uint8Array([...encoder.encode('@batch=b PRIVMSG bob :caf'), 0xe9, 13, 10])
+    )
+    await exchange(alice, 'BATCH -b')
+    expect(since(alice, mark).filter((line) => !/ PONG /.test(line))).toEqual([
+      ':irc.example FAIL PRIVMSG INVALID_UTF8 :Message rejected, your IRC software MUST use UTF-8 encoding on this network',
+      ':irc.example FAIL BATCH MULTILINE_INVALID :Invalid multiline batch with a line not UTF-8',
     ])
   })
 
@@ -740,5 +752,54 @@ describe('draft/multiline', () => {
     await alice.send(...batch('b'))
     await bob.waitFor(/ b29$/, 2000)
     expect(Date.now() - start).toBeGreaterThanOrEqual(250)
+  })
+})
+
+describe('UTF8ONLY', () => {
+  const line = (text: string, ...bytes: number[]) =>
+    new Uint8Array([...encoder.encode(text), ...bytes, 13, 10])
+  const REJECTED =
+    'INVALID_UTF8 :Message rejected, your IRC software MUST use UTF-8 encoding on this network'
+
+  it('Should reject a message that is not UTF-8, and keep the client', async () => {
+    const { register } = setup()
+    const alice = await register('alice', ['batch', 'labeled-response'])
+    const bob = await register('bob')
+    const mark = alice.lines.length
+    await alice.sendBytes(line('PRIVMSG bob :caf', 0xe9))
+    await alice.sendBytes(line('@label=u PRIVMSG bob :', 0xff))
+    await alice.sendBytes(line('@+a=', 0xff, 0x20, 0x50, 0x49, 0x4e, 0x47, 0x20, 0x61))
+    await alice.sendBytes(line('BOG', 0xc0, 0x55, 0x53))
+    await exchange(alice, 'PRIVMSG bob :café')
+    expect(since(alice, mark).filter((line) => !/ PONG /.test(line))).toEqual([
+      `:irc.example FAIL PRIVMSG ${REJECTED}`,
+      `@label=u :irc.example FAIL PRIVMSG ${REJECTED}`,
+      `:irc.example FAIL PING ${REJECTED}`,
+      `:irc.example FAIL * ${REJECTED}`,
+    ])
+    expect(await bob.waitFor(/ PRIVMSG /)).toMatch(/ PRIVMSG bob café$/)
+    await exchange(bob, 'PING x')
+    expect(bob.lines.filter((l) => / PRIVMSG /.test(l))).toHaveLength(1)
+  })
+
+  it('Should reject a realname that is not UTF-8 before the registration', async () => {
+    const { handler } = setup()
+    const client = connect(handler)
+    await client.send('NICK alice')
+    await client.sendBytes(line('USER alice 0 * :Al', 0xef))
+    expect(await client.waitFor(/ FAIL /)).toBe(`:irc.example FAIL USER ${REJECTED}`)
+    await client.send('USER alice 0 * :Alice')
+    await client.waitFor(/ 001 /)
+  })
+
+  it('Should let a client quit without a reason that is not UTF-8', async () => {
+    const { register } = setup()
+    const alice = await register('alice')
+    const bob = await register('bob')
+    await join(alice, '#a')
+    await join(bob, '#a')
+    await alice.sendBytes(line('QUIT :bye ', 0xff))
+    expect((await alice.all()).at(-1)).toMatch(/^ERROR :Closing Link: \S+ \(Quit:\)$/)
+    expect(await bob.waitFor(/ QUIT /)).toMatch(/^:alice!\S+ QUIT Quit:$/)
   })
 })
