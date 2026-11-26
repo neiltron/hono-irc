@@ -118,6 +118,29 @@ describe('The key of the cloaks', () => {
   })
 })
 
+describe('The database', () => {
+  it('Should be the SQLite database of the object', () => {
+    const queries: unknown[][] = []
+    const storage = {
+      kv: { get: () => 'secret', put: () => {} },
+      sql: {
+        exec: (...args: unknown[]) => {
+          queries.push(args)
+          return { toArray: () => [{ ok: 1 }] }
+        },
+      },
+      transactionSync: (fn: () => unknown) => fn(),
+    }
+    new Network({ storage } as unknown as DurableObjectState, {} as Env)
+    const database = servers[0].database
+    expect(database).toBeTruthy()
+    expect(database && database.transaction(() => database.query('SELECT ?', 1))).toEqual([
+      { ok: 1 },
+    ])
+    expect(queries).toEqual([['SELECT ?', 1]])
+  })
+})
+
 describe('The HTTP requests to the Worker', () => {
   it('Should forward a WebSocket upgrade to the object', async () => {
     const { env, requests } = environment()

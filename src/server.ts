@@ -1,6 +1,7 @@
 import type { ContextRenderer } from 'hono'
 import { Hono, getConnection, tcp } from 'tcp-hono'
 import type { Socket, TCPOptions } from 'tcp-hono'
+import { account } from './commands/account.ts'
 import { channels } from './commands/channels.ts'
 import { messages } from './commands/messages.ts'
 import { modes } from './commands/modes.ts'
@@ -8,6 +9,7 @@ import { expire, multiline } from './commands/multiline.ts'
 import { monitor } from './commands/monitor.ts'
 import { queries } from './commands/queries.ts'
 import { registration } from './commands/registration.ts'
+import { sasl } from './commands/sasl.ts'
 import { setname } from './commands/setname.ts'
 import { flood } from './flood.ts'
 import { ERR_INPUTTOOLONG, ERR_NOTREGISTERED, ERR_UNKNOWNCOMMAND } from './numerics.ts'
@@ -112,7 +114,8 @@ export const createServer = (config: ServerOptions = {}) => {
   app.use('*', flood(server))
 
   app.use('*', async (c, next) => {
-    const client = server.clients.get(getConnection(c))
+    const connection = getConnection(c)
+    const client = server.clients.get(connection)
     if (!client) {
       // A connection that was refused in `onOpen()`. Its read loop ends without a message.
       return c.body(null)
@@ -149,6 +152,32 @@ export const createServer = (config: ServerOptions = {}) => {
     client.pinged = false
     c.set('client', client)
     c.set('message', message)
+
+    // The slow step of the command, if it has one, before the outbox is opened, like the wait of
+    // the flood control: what the others send meanwhile is pushed as usual. It runs only for a
+    // command that its handler will get: not for a line that is not UTF-8, a command that is not
+    // allowed yet, or a line of a multiline batch, which the batch takes.
+    const prepare =
+      utf8 &&
+      message.tags?.batch === undefined &&
+      (client.registered || server.beforeRegistration.has(message.command))
+        ? server.prepare.get(message.command)
+        : undefined
+    if (prepare) {
+      let prepared: unknown
+      try {
+        prepared = await prepare(client, message)
+      } catch (error) {
+        // The handler gets nothing, and tells the client that it can not do it now.
+        console.error(error)
+      }
+      // The connection may have been closed meanwhile, e.g. by a timeout. Its client is gone, or
+      // going, so nothing is handled for it.
+      if (connection.closed || server.clients.get(connection) !== client) {
+        return c.body(null)
+      }
+      c.set('prepared', prepared)
+    }
     // The replies come from the server, and a numeric reply has the nickname of the client.
     c.setRenderer(((...lines: Line[]) => {
       server.reply(client, lines)
@@ -232,6 +261,8 @@ export const createServer = (config: ServerOptions = {}) => {
   app.route('/', queries(server))
   app.route('/', monitor(server))
   app.route('/', setname(server))
+  app.route('/', sasl(server))
+  app.route('/', account(server))
 
   // The decoder yields this in place of a line that is too long. The line is dropped and the
   // connection stays open.
@@ -368,5 +399,7 @@ export const createServer = (config: ServerOptions = {}) => {
     capabilities: server.capabilities,
     /** The RPL_ISUPPORT tokens. */
     isupport: server.isupport,
+    /** The accounts in the database, if the server has one. */
+    accounts: server.accounts,
   }
 }

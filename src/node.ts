@@ -1,10 +1,13 @@
 import { createServer as createListener } from 'node:net'
+import { DatabaseSync } from 'node:sqlite'
 import { Duplex } from 'node:stream'
 import type { Socket } from 'tcp-hono'
 import { createServer } from './server.ts'
+import { nodeStore } from './store.ts'
 
-// Node.js
-const server = createServer()
+// Node.js. The accounts are stored in the SQLite file of `DATABASE`, or in memory without it.
+const database = nodeStore(new DatabaseSync(process.env.DATABASE ?? ':memory:'))
+const server = createServer({ database })
 
 // This does what `tcp()` of `tcp-hono/node` does, and also passes the address of the client
 // to `connect()`. The adapter does not expose the socket.

@@ -10,7 +10,7 @@ import {
   ERR_NOORIGIN,
 } from '../numerics.ts'
 import { MAX_LINE_LENGTH, format, truncate } from '../protocol.ts'
-import { NAME_LENGTH, echo, isNickname, msg } from '../state.ts'
+import { NAME_LENGTH, RESERVED, echo, isNickname, msg } from '../state.ts'
 import type { Env, Line, Server } from '../state.ts'
 
 // A `CAP LS` reply is split into lines of this many bytes of capabilities.
@@ -120,6 +120,11 @@ export const registration = (server: Server) => {
     }
     if (nick === client.nick) {
       return c.render()
+    }
+    // The name of an account is reserved for the clients logged in to it. Before the registration,
+    // it is checked when the registration completes, as the client may log in with SASL first.
+    if (client.registered && server.reserved(client, nick)) {
+      return c.render([ERR_NICKNAMEINUSE, nick, RESERVED])
     }
     // A member that is banned can not change its nickname to get around the ban, unless it is an
     // operator or has voice, as on most servers.

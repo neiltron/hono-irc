@@ -1,6 +1,7 @@
 import { DurableObject } from 'cloudflare:workers'
 import { createServer } from './server.ts'
 import type { ServerOptions } from './server.ts'
+import { sqlStore } from './store.ts'
 import { fromWebSocket, negotiate } from './websocket.ts'
 
 type Env = {
@@ -50,14 +51,19 @@ const parseAddress = (address = ''): string | undefined => {
  * a message from a client to the sockets of the others.
  *
  * The users and the channels are in memory. A channel disappears when the last member leaves,
- * so they do not need to be stored while the object has a connection.
+ * so they do not need to be stored while the object has a connection. The accounts are stored in
+ * the SQLite database of the object, whose API is synchronous, as the handlers are.
  */
 export class Network extends DurableObject<Env> {
   #server: ReturnType<typeof createServer>
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
-    this.#server = createServer({ ...options, cloakSecret: cloakSecret(ctx.storage) })
+    this.#server = createServer({
+      ...options,
+      cloakSecret: cloakSecret(ctx.storage),
+      database: sqlStore(ctx.storage),
+    })
     setInterval(this.#server.tick, 30_000)
   }
 

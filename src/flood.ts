@@ -34,8 +34,9 @@ const wait = async (ms: number, connection: Connection) => {
  * messages, and the ones it sends meanwhile wait in the transport: TCP slows the client down, and
  * the WebSocket adapter closes the connection past `maxBufferedBytes`. The others go on as usual.
  *
- * Before the registration, every command takes one token, and the bucket is full again once the
- * client has registered, so a normal registration does not use up what comes after it.
+ * Before the registration, every command takes one token, but one with a prepare step (see
+ * `Server.prepare`), and the bucket is full again once the client has registered, so a normal
+ * registration does not use up what comes after it.
  *
  * It runs before the middleware of `server.ts`, so it counts every line, including the ones that
  * are rejected before the registration, and it waits before the outbox is opened.
@@ -61,7 +62,9 @@ export const flood = (server: Server) => {
 
     // The path is the command and the parameters, each percent-encoded.
     const command = decodeURIComponent(c.req.path.split('/')[1] ?? '')
-    let cost = client.registered ? (options.costs[command] ?? 1) : 1
+    // A command with a prepare step does slow work, such as deriving a key from a password, so it
+    // takes its cost before the registration too.
+    let cost = client.registered || server.prepare.has(command) ? (options.costs[command] ?? 1) : 1
     if (client.inbound) {
       // A multiline batch is charged as a whole, when it closes. The body is read as bytes, which
       // the middleware of `server.ts` reads again from the cache.

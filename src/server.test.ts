@@ -309,9 +309,12 @@ describe('Advertised features', () => {
     const latest = caps(lines.slice(0, -1)).map((cap) => cap.split('=')[0])
     expect(new Set(latest).size).toBe(latest.length)
     expect([...latest].sort()).toEqual([
+      'account-notify',
+      'account-tag',
       'away-notify',
       'batch',
       'cap-notify',
+      'draft/account-registration',
       'draft/multiline',
       'echo-message',
       'extended-join',
@@ -321,6 +324,7 @@ describe('Advertised features', () => {
       'message-tags',
       'multi-prefix',
       'no-implicit-names',
+      'sasl',
       'server-time',
       'setname',
       'standard-replies',

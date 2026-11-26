@@ -8,6 +8,7 @@ import {
   RPL_ENDOFWHOIS,
   RPL_ISON,
   RPL_USERHOST,
+  RPL_WHOISACCOUNT,
   RPL_WHOISBOT,
   RPL_WHOISCHANNELS,
   RPL_WHOISIDLE,
@@ -75,8 +76,8 @@ export const queries = (server: Server) => {
         f: flags(target, channel),
         d: '0',
         l: String(Math.floor((Date.now() - target.idle) / 1000)),
-        // Not logged in, as there are no accounts, and no op levels.
-        a: '0',
+        // `0` for a client that is not logged in. There are no op levels.
+        a: target.account ?? '0',
         o: 'n/a',
         r: target.realname,
       }
@@ -129,6 +130,9 @@ export const queries = (server: Server) => {
           .map((chunk): Line => [RPL_WHOISCHANNELS, target.nick, chunk]),
         [RPL_WHOISSERVER, target.nick, server.name, server.network],
         ...(target.away !== undefined ? [[RPL_AWAY, target.nick, target.away] satisfies Line] : []),
+        ...(target.account !== undefined
+          ? [[RPL_WHOISACCOUNT, target.nick, target.account, 'is logged in as'] satisfies Line]
+          : []),
         ...(target.bot
           ? [[RPL_WHOISBOT, target.nick, `is a Bot on ${server.network}`] satisfies Line]
           : []),

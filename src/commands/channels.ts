@@ -93,7 +93,9 @@ export const channels = (server: Server) => {
       for (const member of channel.members.keys()) {
         if (member.capabilities.has('extended-join')) {
           // `*` means that the client is not logged in to an account.
-          member.send(msg(client.mask, 'JOIN', channel.name, '*', client.realname))
+          member.send(
+            msg(client.mask, 'JOIN', channel.name, client.account ?? '*', client.realname)
+          )
         } else {
           member.send(msg(client.mask, 'JOIN', channel.name))
         }

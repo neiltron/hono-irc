@@ -25,12 +25,19 @@ import {
   ERR_INVITEONLYCHAN,
   RPL_MONOFFLINE,
   RPL_MONONLINE,
+  ERR_NICKNAMEINUSE,
+  ERR_SASLABORTED,
+  RPL_LOGGEDIN,
 } from './numerics.ts'
+import { Accounts } from './accounts.ts'
+import type { AccountOptions } from './accounts.ts'
 import { cloak } from './cloak.ts'
 import { matches } from './masks.ts'
 import type { Glob } from './masks.ts'
 import { MAX_LINE_LENGTH, MAX_TAG_DATA, byteLength, format, tagsLength } from './protocol.ts'
 import type { IRCMessage } from './protocol.ts'
+import { memoryStore, migrate } from './store.ts'
+import type { Store } from './store.ts'
 
 /** A reply from the server. The nickname of the client is inserted into a numeric reply. */
 export type Line = [command: string, ...params: (string | number)[]]
@@ -45,8 +52,16 @@ export type Env = {
   Variables: {
     client: Client
     message: IRCMessage
+    /** What the prepare step of the command made, if it has one. See `Server.prepare`. */
+    prepared: unknown
   }
 }
+
+/**
+ * The slow, asynchronous work of a command, such as deriving a key from a password, which runs
+ * before its synchronous handler and hands it the result. See `Server.prepare`.
+ */
+export type Prepare = (client: Client, message: IRCMessage) => Promise<unknown>
 
 export type ServerOptions = {
   /** The server name, which is the source of the replies. */
@@ -74,6 +89,13 @@ export type ServerOptions = {
    * for each server by default.
    */
   cloakSecret?: string
+  /**
+   * The database: the accounts are stored in it. An in-memory one by default where the runtime has
+   * `node:sqlite`. Without one (`false`, or on a runtime without it), there are no accounts.
+   */
+  database?: Store | false
+  /** The accounts, their registration, and their limits. */
+  accounts?: AccountOptions
 }
 
 /** The limits of a `draft/multiline` batch, which `CAP LS 302` shows. */
@@ -141,6 +163,8 @@ export const MAX_MODES = 4
 export const MAX_MONITOR = 100
 /** The max number of channels that a client is invited to at once. The oldest invite goes first. */
 export const MAX_INVITES = 50
+/** The text of ERR_NICKNAMEINUSE for a nickname that an account reserves. */
+export const RESERVED = 'Nickname is reserved by a different account'
 
 // No whitespace, commas, colons, control characters such as BEL, or format characters,
 // such as the bidirectional overrides and the zero-width ones, which can make two names look alike.
@@ -226,6 +250,12 @@ export const clientTags = (tags?: Record<string, string>): Record<string, string
   return tagsLength(result) <= MAX_TAG_DATA ? result : undefined
 }
 
+/**
+ * A SASL exchange that a client has begun and not finished: the mechanism, and the base64 of the
+ * client's response so far, which comes in chunks of 400 bytes.
+ */
+export type SaslSession = { mechanism: string; response: string }
+
 /** A message to the client during its own command, and whether it is part of the response. */
 export type OutboxEntry = { message: IRCMessage; response: boolean }
 
@@ -294,6 +324,12 @@ export class Client {
   outbox?: OutboxEntry[]
   /** The `draft/multiline` batch that the client is sending, if any. */
   inbound?: InboundBatch
+  /** The name of the account that the client is logged in to, as it was registered. */
+  account?: string
+  /** The SASL exchange that the client is in, if any. */
+  sasl?: SaslSession
+  /** The failed SASL authentications on this connection. */
+  saslFailures = 0
   // The last reference tag of a batch to this client, which is unique for the connection.
   #references = 0
 
@@ -324,7 +360,7 @@ export class Client {
    * must not carry the `label` of the command. The echo of echo-message is the response.
    */
   send(message: IRCMessage, response = true) {
-    message = stamp(this.server.fromBot(message))
+    message = stamp(this.server.sourceTags(message))
     if (this.outbox) {
       this.outbox.push({ message, response })
     } else {
@@ -527,6 +563,8 @@ export class Server {
    * A feature module adds its own here.
    */
   capabilities = new Map<string, string | undefined>([
+    ['account-notify', undefined],
+    ['account-tag', undefined],
     ['away-notify', undefined],
     ['cap-notify', undefined],
     ['echo-message', undefined],
@@ -552,7 +590,7 @@ export class Server {
     ['time', 'server-time'],
     // The spec of bot mode sends it only with `message-tags`.
     ['bot', 'message-tags'],
-    // ['account', 'account-tag'],
+    ['account', 'account-tag'],
     ['msgid', 'message-tags'],
     ['batch', 'batch'],
     ['label', 'labeled-response'],
@@ -563,6 +601,23 @@ export class Server {
 
   /** The commands that a client can send before the registration. */
   beforeRegistration = new Set(['CAP', 'NICK', 'USER', 'PASS', 'PING', 'PONG', 'QUIT'])
+
+  /**
+   * The prepare steps of the commands, by command. A handler is synchronous, so the slow work that
+   * a command needs, which is asynchronous, such as deriving a key from a password with WebCrypto,
+   * is done here first. The middleware of `server.ts` runs it before the outbox is opened, like
+   * the wait of the flood control, and hands the result to the handler as `c.var.prepared`.
+   *
+   * A step only computes: it must not change the state, which the others can change meanwhile.
+   * The handler reads the state again and decides. A command with a step takes its flood cost
+   * even before the registration.
+   */
+  prepare = new Map<string, Prepare>()
+
+  /** The database, if the server has one. */
+  store?: Store
+  /** The accounts, if the server has a database. */
+  accounts?: Accounts
 
   constructor(config: ServerOptions = {}) {
     this.name = config.name ?? 'irc.hono.local'
@@ -575,7 +630,13 @@ export class Server {
         : {
             burst: config.flood?.burst ?? 10,
             interval: config.flood?.interval ?? 2000,
-            costs: config.flood?.costs ?? { NICK: 3, JOIN: 2, PART: 2 },
+            costs: config.flood?.costs ?? {
+              NICK: 3,
+              JOIN: 2,
+              PART: 2,
+              AUTHENTICATE: 2,
+              REGISTER: 3,
+            },
           }
     this.maxConnections = config.maxConnections ?? 1000
     this.maxConnectionsPerIp = config.maxConnectionsPerIp ?? 10
@@ -590,6 +651,12 @@ export class Server {
       Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) =>
         byte.toString(16).padStart(2, '0')
       ).join('')
+    const store = config.database === false ? undefined : (config.database ?? memoryStore())
+    if (store) {
+      migrate(store)
+      this.store = store
+      this.accounts = new Accounts(store, (name) => this.fold(name), config.accounts)
+    }
     this.isupport = new Map<string, string | true>([
       ['CASEMAPPING', 'ascii'],
       ['CHANTYPES', '#'],
@@ -818,18 +885,67 @@ export class Server {
   }
 
   /**
-   * Add the `bot` tag to a message whose source is a client in bot mode. The client is found by
-   * the nickname of the source when the message is sent, and the source must be its whole mask.
+   * Add the tags that tell about the client that a message comes from: `bot` for a client in bot
+   * mode, and `account` for one that is logged in (account-tag). The client is found by the
+   * nickname of the source when the message is sent, and the source must be its whole mask.
    */
-  fromBot(message: IRCMessage): IRCMessage {
+  sourceTags(message: IRCMessage): IRCMessage {
     const bang = message.source?.indexOf('!') ?? -1
-    if (bang < 1 || message.tags?.bot !== undefined) {
+    if (bang < 1) {
       return message
     }
     const sender = this.nicks.get(this.fold(message.source!.slice(0, bang)))
-    return sender?.bot && sender.mask === message.source
-      ? { ...message, tags: { ...message.tags, bot: '' } }
-      : message
+    if (!sender || sender.mask !== message.source || !(sender.bot || sender.account)) {
+      return message
+    }
+    // After the tags that the message has, and without replacing them.
+    const tags = { ...message.tags }
+    if (sender.bot) {
+      tags.bot ??= ''
+    }
+    if (sender.account) {
+      tags.account ??= sender.account
+    }
+    return { ...message, tags }
+  }
+
+  /**
+   * Whether the nickname is the name of an account that the client is not logged in to, which
+   * reserves it, unless `reserveNicknames` is off.
+   */
+  reserved(client: Client, nick: string) {
+    if (!this.accounts?.reserveNicknames) {
+      return false
+    }
+    const owner = this.accounts.get(nick)
+    return !!owner && (client.account === undefined || this.fold(client.account) !== owner.folded)
+  }
+
+  /**
+   * Log the client in to an account, with RPL_LOGGEDIN and the `lines` that go with it, such as
+   * RPL_SASLSUCCESS. A registered client is then shown with ACCOUNT to itself and to the others
+   * that have account-notify (account-notify, extended-monitor). The ACCOUNT is sent before the
+   * account is set, so its `account` tag is the one the client had, as account-tag shows.
+   */
+  login(client: Client, account: string, ...lines: Line[]) {
+    // Before the registration, the client may not have a nickname or a username yet.
+    const mask = client.nick === '*' ? '*' : `${client.nick}!${client.user || '*'}@${client.host}`
+    this.reply(client, [
+      [RPL_LOGGEDIN, mask, account, `You are now logged in as ${account}`],
+      ...lines,
+    ])
+    if (client.registered && client.account !== account) {
+      const notice = msg(client.mask, 'ACCOUNT', account)
+      for (const peer of this.audience(client, 'account-notify')) {
+        peer.send(notice)
+      }
+      if (client.capabilities.has('account-notify')) {
+        client.send(notice)
+      }
+    }
+    client.account = account
+    // An exchange that is still open, e.g. when the client registers the account, has no use.
+    client.sasl = undefined
   }
 
   /**
@@ -925,14 +1041,32 @@ export class Server {
     return lines
   }
 
-  /** Complete the registration if the client has sent everything. Returns the welcome messages. */
+  /**
+   * Complete the registration if the client has sent everything. Returns the welcome messages.
+   *
+   * A SASL exchange that is still going on is aborted first, as sasl-3.1 says, so the client
+   * registers without the account. A nickname that an account reserves stops the registration
+   * with ERR_NICKNAMEINUSE, and is released, so the client can send another one.
+   */
   register(client: Client): Line[] {
     if (client.registered || client.negotiating || client.nick === '*' || !client.user) {
       return []
     }
+    const lines: Line[] = []
+    if (client.sasl) {
+      client.sasl = undefined
+      lines.push([ERR_SASLABORTED, 'SASL authentication aborted'])
+    }
+    if (this.reserved(client, client.nick)) {
+      const nick = client.nick
+      this.nicks.delete(this.fold(nick))
+      client.nick = '*'
+      return [...lines, [ERR_NICKNAMEINUSE, nick, RESERVED]]
+    }
     client.registered = true
     this.notifyMonitors(client.nick, client)
     return [
+      ...lines,
       [RPL_WELCOME, `Welcome to the ${this.network} Network, ${client.mask}`],
       [RPL_YOURHOST, `Your host is ${this.name}, running version ${VERSION}`],
       [RPL_CREATED, `This server was created ${this.created.toUTCString()}`],
