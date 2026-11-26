@@ -38,7 +38,8 @@ app.on('TCP', '/PRIVMSG/:targets/:text', (c) => { ... })
 | [`src/flood.ts`](./src/flood.ts)                                 | The flood control: a token bucket and fake lag for each connection        |
 | [`src/commands/registration.ts`](./src/commands/registration.ts) | `CAP`, `NICK`, `USER`, `PASS`, `PING`, `PONG`, `QUIT`                     |
 | [`src/commands/channels.ts`](./src/commands/channels.ts)         | `JOIN`, `PART`, `TOPIC`, `NAMES`, `LIST`, `KICK`                          |
-| [`src/commands/messages.ts`](./src/commands/messages.ts)         | `PRIVMSG`, `NOTICE`, `AWAY`                                               |
+| [`src/commands/messages.ts`](./src/commands/messages.ts)         | `PRIVMSG`, `NOTICE`, `TAGMSG`, `AWAY`                                     |
+| [`src/commands/multiline.ts`](./src/commands/multiline.ts)       | `BATCH` from a client: the batches of `draft/multiline`                   |
 | [`src/commands/modes.ts`](./src/commands/modes.ts)               | `MODE`                                                                    |
 | [`src/commands/queries.ts`](./src/commands/queries.ts)           | `WHO`, `WHOIS`, `ISON`, `USERHOST`, `MOTD`, `LUSERS`                      |
 | [`src/websocket.ts`](./src/websocket.ts)                         | The IRCv3 WebSocket transport: a WebSocket as a socket of `tcp-hono`      |
@@ -49,7 +50,9 @@ app.on('TCP', '/PRIVMSG/:targets/:text', (c) => { ... })
 - Each file in `src/commands` is a Hono app, and `src/server.ts` mounts them with `app.route()`.
 - A message to a client is sent with `client.send(message)` or `channel.send(message)`. While a client's own command is handled, the messages to it, and the replies of `c.render(['332', channel, topic])`, are collected in order and written as the response. The nickname of the client is inserted into a numeric reply.
 - The messages to the others are pushed to their connections with `connection.send()`.
-- A message tag is sent only to a client that has the capability of the tag, such as `server-time` for `time`. The capabilities, the `RPL_ISUPPORT` tokens, and the tags are registered in `Server`.
+- A message tag is sent only to a client that has the capability of the tag, such as `server-time` for `time`, and a client-only tag (`+name`) only to a client that has `message-tags`. The capabilities, the `RPL_ISUPPORT` tokens, and the tags are registered in `Server`, and `client.format()` filters them.
+- The `label` of `labeled-response` is added by the same middleware, to the messages of the outbox, which are exactly what the command caused: one line gets the label, none gets `ACK`, and more are put in a `labeled-response` batch. So every command is covered, including the errors, `421`, `417`, and the `ERROR` of `QUIT`. A message to the client that its command did not answer, such as its own private message to itself, is sent with `client.send(message, false)` and stays out of the response.
+- `client.sendBatch()` sends messages as a batch to a client that has `batch`, and as single lines to the others. The standard replies are lines such as `fail('BATCH', 'TIMEOUT', ref, 'description')`, rendered like numerics.
 - A runtime hands over a socket with `connect(socket, info)` of the server.
 - On Cloudflare Workers, the `connect()` handler of the Worker pipes the socket to the `connect()` handler of one Durable Object. The object holds all the connections, which is why a message from a client can be written to the sockets of the others.
 - A WebSocket goes to the same object: the `fetch()` handler of the Worker forwards the upgrade request to it, and `fromWebSocket()` of `src/websocket.ts` turns the WebSocket into a socket for the same `connect()` of the server. A WebSocket client and a TCP client are in the same channels.
@@ -60,7 +63,7 @@ app.on('TCP', '/PRIVMSG/:targets/:text', (c) => { ... })
 The Worker serves the [IRCv3 WebSocket transport](https://ircv3.net/specs/extensions/websocket) at `/`, which web clients such as [gamja](https://codeberg.org/emersion/gamja) speak. A `GET /` without an upgrade describes the server in plain text.
 
 - `pnpm dev` serves it at `ws://localhost:5173/`. Deployed, it is `wss://hono-irc.<subdomain>.workers.dev/`, which has TLS on any plan.
-- Each WebSocket message is one IRC line without CRLF. The subprotocols are `text.ircv3.net` (text messages, UTF-8; the bytes that are not UTF-8 become U+FFFD) and `binary.ircv3.net` (binary messages, any bytes). The first one that the client offers wins. A client that offers neither is accepted without a subprotocol, and gets the type of its own first message, or text before that.
+- Each WebSocket message is one IRC line without CRLF. The subprotocols are `text.ircv3.net` (text messages, UTF-8) and `binary.ircv3.net` (binary messages, any bytes). The server sends only UTF-8, as `UTF8ONLY` says, and rejects a line from a client that is not UTF-8, which only a binary message can carry, as over TCP. The first one that the client offers wins. A client that offers neither is accepted without a subprotocol, and gets the type of its own first message, or text before that.
 - A line has the same limits as over TCP: a message longer than 4096 bytes of tags and 510 bytes of the rest gets `ERR_INPUTTOOLONG`, and the connection stays open. A message with a line break inside, or longer than 64 KiB, closes the connection. So does a client that sends faster than the server reads, or does not read what is sent to it, beyond 1 MiB, like `maxBufferedBytes` of `tcp-hono` for TCP.
 - Any `Origin` is allowed. The server reads no cookies and no HTTP authentication, so a page on another origin can do nothing that it could not do by connecting directly. `src/index.ts` explains it.
 - The object accepts the WebSocket with `accept()`, not with the hibernation API, because the state is in memory and a hibernated object would lose it.
@@ -83,16 +86,22 @@ The dependency is pinned to a commit, and pnpm builds it on install. To update i
 - Registration: `CAP`, `NICK`, `USER`, `PASS` (not checked), `PING`, `PONG`, `QUIT`
 - Channels: `JOIN`, `PART`, `TOPIC`, `NAMES`, `LIST`, `KICK`, `MODE` (`+o`, `+v`, `+m`, `+n`, `+t`)
 - Users: `MODE` (`+i`: an invisible user is left out of `NAMES` and `WHO` of a channel for those outside it)
-- Messages: `PRIVMSG`, `NOTICE`, `AWAY`
+- Messages: `PRIVMSG`, `NOTICE`, `TAGMSG`, `AWAY`, and multiline messages
 - Queries: `WHO`, `WHOIS`, `ISON`, `USERHOST`, `MOTD`, `LUSERS`
-- IRCv3: capability negotiation 3.2, `cap-notify`, `server-time`, `echo-message`, `multi-prefix`, `userhost-in-names`, `extended-join`, `away-notify`, and the WebSocket transport (Cloudflare Workers only)
+- IRCv3: capability negotiation 3.2, `cap-notify`, `server-time`, `echo-message`, `multi-prefix`, `userhost-in-names`, `extended-join`, `away-notify`, `message-tags`, `message-ids`, `batch`, `labeled-response`, `standard-replies`, `draft/multiline`, `UTF8ONLY`, and the WebSocket transport (Cloudflare Workers only)
+  - `message-tags`: the client-only tags of `PRIVMSG`, `NOTICE`, and `TAGMSG` are relayed to the clients that have the capability, whether the sender has it or not, and `TAGMSG` is delivered only to them. The other tags of a client are never relayed. `CLIENTTAGDENY=` says that every client-only tag is allowed. `TAGMSG` is answered like `PRIVMSG`, without `RPL_AWAY`.
+  - `msgid`: every `PRIVMSG`, `NOTICE`, `TAGMSG`, and multiline message has one, the same for all its recipients and the echo, and one for each target. It is like a ULID: the time in milliseconds and 80 random bits, so the IDs sort by time and do not repeat after a restart.
+  - `labeled-response` is used only when the client also has `batch`, which it depends on. A label longer than 64 bytes is ignored. A message to oneself with `echo-message` comes twice, the delivered one without the label and the echo with it.
+  - `draft/multiline` (`max-bytes=4096,max-lines=100` by default): a batch is checked as it comes and delivered when it ends, with the checks of `PRIVMSG` done once for the whole message. A client that does not have the capability, or `batch`, gets the lines one by one, without the blank ones, and with the message ID and the client-only tags on the first one. A batch that breaks a rule gets a `FAIL` and the rest of it is ignored, and so are the lines of a batch that is not open. One batch can be open at a time; it is dropped after `timeout` (30 seconds, checked by `tick()`) and on a disconnection. The other commands are handled as usual while a batch is open. The sender needs `draft/multiline` and `batch`.
+  - `UTF8ONLY`: a line that is not UTF-8 gets `FAIL <command> INVALID_UTF8` and is not handled, and the client stays. A `QUIT` is handled without its reason.
 - `CASEMAPPING=ascii`. The lengths of `NICKLEN`, `CHANNELLEN`, `TOPICLEN`, `AWAYLEN`, and `KICKLEN` are in bytes.
-- Lines: a client can send 4096 bytes of tags and 512 bytes of the rest. A longer line gets `ERR_INPUTTOOLONG` and is dropped. A line from the server is at most 512 bytes without the tags: a longer last parameter is cut.
-- Targets: `PRIVMSG`, `NOTICE`, and `KICK` take up to four, and `NAMES`, `WHO`, and `WHOIS` one, as `TARGMAX` shows. A repeated target counts once.
+- Lines: a client can send 4096 bytes of tags and 512 bytes of the rest. A longer line gets `ERR_INPUTTOOLONG` and is dropped. A line from the server is at most 512 bytes without the tags: a longer last parameter is cut. The tags that the server adds come first and are far below their 4094 bytes, and the relayed client-only tags are at most 4094 bytes, so a line has at most 8191 bytes of tags.
+- Targets: `PRIVMSG`, `NOTICE`, `TAGMSG`, and `KICK` take up to four, and `NAMES`, `WHO`, and `WHOIS` one, as `TARGMAX` shows. A repeated target counts once.
 - The address of the client is passed to the server, from `CF-Connecting-IP` for a WebSocket and from the Worker for TCP (see below). It is not shown to the other users, who see a random host.
 - A client that does not answer a `PING` is disconnected, and so is one that has not registered in time after it connected.
 - Limits, set with the options of `createServer()`:
-  - `flood`: a token bucket for each connection, by default 10 commands at once and one more every 2 seconds, with `NICK`, `JOIN`, and `PART` taking more. A client that runs out is not disconnected: its commands wait until the tokens are back (fake lag), so a burst is handled in full and in order, only slower. The others are not slowed down. `false` turns it off.
+  - `flood`: a token bucket for each connection, by default 10 commands at once and one more every 2 seconds, with `NICK`, `JOIN`, and `PART` taking more. A client that runs out is not disconnected: its commands wait until the tokens are back (fake lag), so a burst is handled in full and in order, only slower. The others are not slowed down. `false` turns it off. The lines of a multiline batch are free, and the batch takes one token for every 512 bytes or every 5 lines, whichever is more, when it ends.
+  - `multiline`: `maxBytes` (4096), `maxLines` (100), and `timeout` (30 seconds) of a `draft/multiline` batch.
   - `maxConnections` (1000), `maxConnectionsPerIp` (10, when the runtime knows the address), and `maxChannels` (1000).
 
 ## What is not implemented
@@ -100,7 +109,7 @@ The dependency is pinned to a commit, and pnpm builds it on install. To update i
 - TLS over TCP. According to the Cloudflare documentation, Spectrum terminates TLS for a Worker only with the Enterprise add-on, and `startTls()` is not supported for an inbound socket. A WebSocket has TLS (`wss://`) once deployed, which has not been tried.
 - Accounts (`SASL`), bans, invites, keys, operators, and server-to-server links.
 - The WebSocket transport on Node.js, which has no WebSocket server built in. `src/websocket.ts` does not depend on a runtime.
-- The other IRCv3 extensions, such as `message-tags`, `batch`, `labeled-response`, and `chathistory`.
+- The other IRCv3 extensions, such as `chathistory`, `account-tag`, and `STATUSMSG`. No standard reply is sent beyond what a spec defines, so `standard-replies` changes nothing yet.
 
 ## The address of the client
 

@@ -5,6 +5,7 @@
 //
 // It exits with 1 on the first failure or timeout.
 import assert from 'node:assert/strict'
+import { connect as connectSocket } from 'node:net'
 import IRC from 'irc-framework'
 
 const host = process.argv[2] ?? '127.0.0.1'
@@ -77,13 +78,80 @@ const step = async (name, fn) => {
 
 const users = (event) => event.users.map((u) => u.modes.join('') + u.nick).sort()
 
-const alice = await connect('alice')
+/** A message with tags, which irc-framework sends as it is with `raw()`. */
+const tagged = (tags, command, ...params) =>
+  Object.assign(new IRC.Message(command, ...params), { tags })
+
+/**
+ * A client on a plain socket, for what irc-framework does not speak, such as draft/multiline, or
+ * bytes that are not UTF-8.
+ */
+const rawClient = async (nick, caps) => {
+  const socket = connectSocket({ host, port })
+  const lines = []
+  let waiters = []
+  let buffer = ''
+  socket.setEncoding('utf8')
+  socket.on('data', (data) => {
+    buffer += data
+    const parts = buffer.split('\r\n')
+    buffer = parts.pop()
+    lines.push(...parts)
+    for (const waiter of waiters) {
+      waiter()
+    }
+  })
+  const send = (...messages) => socket.write(messages.map((m) => m + '\r\n').join(''))
+  let cursor = 0
+  /** Wait for the next line that matches. The lines before it are skipped. */
+  const waitFor = (pattern) =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        waiters = waiters.filter((w) => w !== check)
+        reject(new Error(`timeout waiting for ${pattern} on ${nick}:\n${lines.join('\n')}`))
+      }, TIMEOUT)
+      const check = () => {
+        while (cursor < lines.length) {
+          const line = lines[cursor++]
+          if (pattern.test(line)) {
+            clearTimeout(timer)
+            waiters = waiters.filter((w) => w !== check)
+            resolve(line)
+            return
+          }
+        }
+      }
+      waiters.push(check)
+      check()
+    })
+  await new Promise((resolve) => socket.once('connect', resolve))
+  send(
+    'CAP LS 302',
+    `CAP REQ :${caps.join(' ')}`,
+    'CAP END',
+    `NICK ${nick}`,
+    `USER ${nick} 0 * :${nick}`
+  )
+  await waitFor(/ 376 /)
+  return { socket, send, waitFor }
+}
+
+const alice = await connect('alice', ['echo-message', 'labeled-response'])
 const bob = await connect('bob')
 
 await step('registration and ISUPPORT', async () => {
   assert.ok(alice.network.cap.enabled.includes('echo-message'))
   assert.ok(alice.network.cap.enabled.includes('cap-notify'))
-  assert.equal(alice.network.supports('TARGMAX'), 'PRIVMSG:4,NOTICE:4,KICK:4,NAMES:1,WHO:1,WHOIS:1')
+  assert.equal(
+    alice.network.supports('TARGMAX'),
+    'PRIVMSG:4,NOTICE:4,TAGMSG:4,KICK:4,NAMES:1,WHO:1,WHOIS:1'
+  )
+  // irc-framework asks for message-tags and batch itself, and alice for labeled-response.
+  for (const cap of ['message-tags', 'batch', 'labeled-response']) {
+    assert.ok(alice.network.cap.enabled.includes(cap), cap)
+  }
+  assert.equal(alice.network.supports('UTF8ONLY'), true)
+  assert.ok(alice.network.supportsTag('typing'), 'CLIENTTAGDENY allows every client-only tag')
   assert.equal(alice.network.supports('AWAYLEN'), '300')
   assert.equal(alice.network.supports('CASEMAPPING'), 'ascii')
 })
@@ -120,6 +188,103 @@ await step('private message', async () => {
   const received = once(alice, 'privmsg', (e) => e.target === 'alice')
   bob.say('alice', 'psst, a DM')
   assert.equal((await received).message, 'psst, a DM')
+})
+
+await step('message-tags, message-ids, and TAGMSG', async () => {
+  const received = once(bob, 'privmsg', (e) => e.message === 'tagged')
+  const echoed = once(alice, 'privmsg', (e) => e.message === 'tagged')
+  alice.say('#hono', 'tagged', { '+example.com/reply': 'abc' })
+  const [message, echo] = await Promise.all([received, echoed])
+  assert.equal(message.tags['+example.com/reply'], 'abc')
+  assert.match(message.tags.msgid, /^[0-9A-Z]{26}$/)
+  assert.equal(echo.tags.msgid, message.tags.msgid)
+  const typing = once(bob, 'tagmsg')
+  alice.tagmsg('#hono', { '+typing': 'active' })
+  const event = await typing
+  assert.equal(event.target, '#hono')
+  assert.equal(event.tags['+typing'], 'active')
+  assert.ok(event.tags.msgid)
+})
+
+await step('labeled-response and batch', async () => {
+  const pong = line(alice, /^@\S*label=p1\S* \S+ PONG \S+ labeled$/)
+  alice.raw(tagged({ label: 'p1' }, 'PING', 'labeled'))
+  await pong
+  const ack = line(alice, /^@\S*label=a1\S* \S+ ACK$/)
+  alice.raw(tagged({ label: 'a1' }, 'PONG', 'x'))
+  await ack
+  // Several replies come in a batch, which irc-framework collects and handles at its end.
+  const start = line(alice, /^@\S*label=w1\S* \S+ BATCH \+\S+ labeled-response$/)
+  const batch = once(alice, 'batch end labeled-response')
+  const whois = once(alice, 'whois', (e) => e.nick === 'bob')
+  alice.raw(tagged({ label: 'w1' }, 'WHOIS', 'bob'))
+  await start
+  const commands = (await batch).commands.map((c) => c.command)
+  assert.equal(commands.at(-1), '318')
+  assert.equal((await whois).ident, '~bob')
+  // The echo has the label, and the copy to the others does not.
+  const echoed = line(alice, /^@\S*label=e1\S* :alice!\S+ PRIVMSG #hono :?labeled$/)
+  const relayed = line(bob, / PRIVMSG #hono :?labeled$/)
+  alice.raw(tagged({ label: 'e1' }, 'PRIVMSG', '#hono', 'labeled'))
+  await echoed
+  assert.ok(!(await relayed).includes('label='))
+})
+
+await step('draft/multiline from a raw client, and its fallback to irc-framework', async () => {
+  const erin = await rawClient('erin', [
+    'batch',
+    'draft/multiline',
+    'echo-message',
+    'labeled-response',
+    'message-tags',
+  ])
+  erin.send('JOIN #hono')
+  await erin.waitFor(/ 366 erin #hono /)
+  const received = []
+  const done = new Promise((resolve) => {
+    const handler = (e) => {
+      if (e.nick === 'erin') {
+        received.push(e)
+        if (received.length === 3) {
+          alice.removeListener('privmsg', handler)
+          resolve()
+        }
+      }
+    }
+    alice.on('privmsg', handler)
+  })
+  erin.send(
+    'BATCH +ml draft/multiline #hono',
+    '@batch=ml PRIVMSG #hono hello',
+    '@batch=ml PRIVMSG #hono :',
+    '@batch=ml PRIVMSG #hono :how is ',
+    '@batch=ml;draft/multiline-concat PRIVMSG #hono :everyone?',
+    '@label=ml1 BATCH -ml'
+  )
+  const echo = await erin.waitFor(/^@\S*label=ml1\S* :erin!\S+ BATCH \+\S+ draft\/multiline #hono$/)
+  await erin.waitFor(/^:erin!\S+ BATCH -/)
+  await done
+  // irc-framework does not have draft/multiline: the lines without the blank one, and the ID on
+  // the first one, the same as the echo's.
+  assert.deepEqual(
+    received.map((e) => e.message),
+    ['hello', 'how is ', 'everyone?']
+  )
+  assert.equal(received[0].tags.msgid, /msgid=([^; ]+)/.exec(echo)[1])
+  assert.equal(received[1].tags.msgid, undefined)
+
+  erin.send('BATCH +bad draft/multiline #hono', '@batch=bad PRIVMSG #other :x', 'BATCH -bad')
+  await erin.waitFor(/ FAIL BATCH MULTILINE_INVALID_TARGET #hono #other :/)
+
+  // UTF8ONLY: the line is rejected and not relayed, and the client stays.
+  erin.socket.write(Buffer.from([...Buffer.from('PRIVMSG #hono :caf'), 0xe9, 13, 10]))
+  await erin.waitFor(/ FAIL PRIVMSG INVALID_UTF8 :/)
+  const after = once(alice, 'privmsg', (e) => e.nick === 'erin')
+  erin.send('PRIVMSG #hono :café')
+  assert.equal((await after).message, 'café')
+  const quit = once(alice, 'quit', (e) => e.nick === 'erin')
+  erin.send('QUIT')
+  await quit
 })
 
 await step('mode, and multi-prefix in WHO', async () => {
